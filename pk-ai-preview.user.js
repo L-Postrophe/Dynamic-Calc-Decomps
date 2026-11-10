@@ -1,9 +1,10 @@
 // ==UserScript==
-// @name         Platinum Kaizo AI Odds � Inline Damage Results
+// @name         Platinum Kaizo AI Odds — Inline Damage Results
 // @namespace    https://github.com/hzla/Dynamic-Calc-Decomps
-// @version      1.0.0
-// @description  Inline AI odds and move-dependent history controls; no floating panel.
+// @version      1.2.0
+// @description  Inline AI preview with contextual inputs; hides legacy Quick HP controls.
 // @match        https://hzla.github.io/Dynamic-Calc-Decomps/*
+// @match        https://l-postrophe.github.io/Dynamic-Calc-Decomps/*
 // @match        https://hzla.github.io/Dynamic-Calc/*
 // @grant        none
 // @run-at       document-idle
@@ -569,26 +570,36 @@
   // percent; avoid rounding a percentage directly back to damage when ambiguous.
   function parseDamageDetail(text,maxHp){
     if(!Number.isInteger(maxHp)||maxHp<=0)return {damage:null,reason:'Missing target maximum HP'};
-    const stripped=normalize(text).replace(/\s*\(AI:\s*~?\d+(?:\.\d+)?%\)/ig,'');
+    const stripped=normalize(text).replace(/\s*\(AI(?: est)?:\s*~?\d+(?:\.\d+)?%\)/ig,'');
     const match=stripped.match(/(\d+(?:\.\d+)?)\s*%?\s*[-–—]\s*(\d+(?:\.\d+)?)\s*%/);
     if(!match)return {damage:null,reason:'No damage range in result'};
     const pct=Number(match[2]),decimals=(match[2].split('.')[1]||'').length,epsilon=0.5*10**(-decimals);
-    const lower=Math.max(0,Math.ceil((pct-epsilon)*maxHp/100-1e-9));
-    const upper=Math.floor((pct+epsilon)*maxHp/100+1e-9);
-    if(lower===upper)return {damage:lower,reason:'Inferred unique max HP damage from rounded display',percentage:pct,exactDisplay:true};
-    // Do not erase a known numerical interval: the scoring UI can show a
-    // conditional estimate using the middle integer (never label it exact).
-    return {damage:null,estimatedDamage:Math.round((lower+upper)/2),reason:`Ambiguous rounded damage (${lower}–${upper} HP)`,percentage:pct,range:[lower,upper],approximate:true};
+    // The display rounds a raw integer HP damage percentage; it does NOT
+    // mean that the game rounds damage itself. Invert that rounding and keep
+    // all integer candidates. At the 0.05% boundary, test the formatting
+    // rather than accidentally including both sides of a half-up tie.
+    const lower=Math.max(0,Math.ceil((pct-epsilon)*maxHp/100-2));
+    const upper=Math.floor((pct+epsilon)*maxHp/100+2);
+    const possible=[];
+    for(let d=lower;d<=upper;d++){
+      if(Number((100*d/maxHp).toFixed(decimals))===pct)possible.push(d);
+    }
+    if(possible.length===1)return {damage:possible[0],reason:'Unique HP damage consistent with rounded displayed percentage',percentage:pct,exactDisplay:true};
+    if(!possible.length)return {damage:null,reason:'Displayed percentage is inconsistent with conventional decimal rounding; native integer damage required',percentage:pct};
+    const min=possible[0],max=possible[possible.length-1];
+    // The displayed percentage is genuinely insufficient to uniquely recover
+    // HP damage. Show an estimate, never disguise it as exact cartridge damage.
+    return {damage:null,estimatedDamage:Math.round((min+max)/2),reason:`Ambiguous rounded damage (${min}–${max} HP)`,percentage:pct,range:[min,max],approximate:true};
   }
   function parseDamage(text,maxHp){return parseDamageDetail(text,maxHp).damage;}
   // Values below are read from the *calculator*, never from an extension form.
   // A missing field stays null; false and zero are not interchangeable with missing.
   const FLAG_KEYS=['basic','evalAtt','expert','doubles','setupFirstTurn','risky','prioDamage','batonPass','checkHP','weather','harassment'];
   const flagSynonyms={
-    basic:['basic'],evalAtt:['evalatt','evaluateattack','evalattack'],expert:['expert'],
-    doubles:['doubles','tagstrategy','tag'],setupFirstTurn:['setupfirstturn','firstturnsetup'],
-    risky:['risky'],prioDamage:['priodamage','prioritizedamage','damageprio','prioritizeextremes'],
-    batonPass:['batonpass'],checkHP:['checkhp'],weather:['weather'],harassment:['harassment','harass']
+    basic:['basic'],evalAtt:['evalatt','evaluateatks','evaluateatk','evaluateattack','evaluateattacks','evalattack','evalatks'],expert:['expert'],
+    doubles:['doubles','tagstrategy','tag','doublesai'],setupFirstTurn:['setupfirstturn','firstturnsetup','status','setup'],
+    risky:['risky'],prioDamage:['priodamage','prioritizedamage','damageprio','prioritizeextremes','damage'],
+    batonPass:['batonpass'],checkHP:['checkhp'],weather:['weather'],harassment:['harassment','harass','harrassment']
   };
   const flatKey=s=>String(s??'').toLowerCase().replace(/[^a-z0-9]/g,'');
   function decodeFlags(source){
@@ -645,7 +656,66 @@
       return decodeFlags(entry);
     return null;
   }
+  // The Dynamic Calc renders trainer AI flags as SMALL, VISIBLE BADGES
+  // under the selected enemy set. Older readers only searched for data-ai-flags
+  // attributes (which the live calc need not expose). Recover the COMPLETE
+  // displayed set, not merely the first badge, so absent flags mean false.
+  function parseVisibleFlagLabels(labels){
+    const cleaned=(labels||[]).map(flatKey).filter(Boolean);
+    const recognized=cleaned.map(label=>FLAG_KEYS.find(f=>flagSynonyms[f].includes(label))||null);
+    if(recognized.some(x=>x===null)||!recognized.length)return null;
+    return Object.fromEntries(FLAG_KEYS.map(f=>[f,recognized.includes(f)]));
+  }
+  function readVisibleFlagBadges(doc){
+    const roots=['#p2','#p2info','.trainer-ai-flags','#ai-flags-container','#aiFlags'];
+    let best=null;
+    for(const sel of roots){
+      const root=doc.querySelector(sel);
+      if(!root?.querySelectorAll)continue;
+      const all=Array.from(root.querySelectorAll('span,div,button,label,li,small,b,strong'));
+      const chips=[];
+      for(const el of all){
+        if(el.closest?.('#pkai-context,.pkai-inline-odds'))continue;
+        if(el.hidden || el.getAttribute?.('aria-hidden')==='true')continue;
+        const label=flatKey(el.textContent);
+        if(!label||!FLAG_KEYS.some(f=>flagSynonyms[f].includes(label)))continue;
+        // Prefer a leaf: otherwise both the badge and its wrapper are counted.
+        if(Array.from(el.children||[]).some(child=>flatKey(child.textContent)===label))continue;
+        chips.push({el,label});
+      }
+      // The AI flags are a contiguous run of badges. Find their smallest
+      // shared container, rather than interpreting an arbitrary whole page.
+      const buckets=new Map();
+      for(const {el,label} of chips){
+        let parent=el.parentElement;
+        for(let depth=0;parent&&depth<5;depth++,parent=parent.parentElement){
+          if(parent===root.parentElement)break;
+          const text=String(parent.textContent||'').trim();
+          if(text.length>220)break;
+          if(!buckets.has(parent))buckets.set(parent,new Set());
+          buckets.get(parent).add(label);
+          if(parent===root)break;
+        }
+      }
+      for(const [el,labelSet] of buckets){
+        const labels=[...labelSet];
+        const complete=parseVisibleFlagLabels(labels);
+        if(!complete)continue;
+        const flagged=/(ai[-_ ]?flags?|trainer[-_ ]?ai)/i.test(String(el.className||'')+' '+String(el.id||''));
+        // Require at least two chips unless the container explicitly says AI flags.
+        if(labels.length<2&&!flagged)continue;
+        const len=String(el.textContent||'').length;
+        const merit=labels.length*1000-len;
+        if(!best||merit>best.merit)best={flags:complete,
+          source:'visible AI flag badges ('+sel+')',merit};
+      }
+    }
+    return best?{flags:best.flags,source:best.source}:null;
+  }
   function readTrainerFlags(doc,globals={}){
+    // What the player currently sees takes precedence over stale global sets.
+    const badges=readVisibleFlagBadges(doc);
+    if(badges)return badges;
     const explicit=[
       '#p2[data-ai-flags]','#p2[data-ai-mask]',
       '#p2 [data-ai-flags]','#p2 [data-ai-mask]',
@@ -766,6 +836,22 @@
     const firstTurnOut=readBoolean(doc,[`#firstTurnOut${suffix}`,`#${root} [data-first-turn-out]`]);
     return {lastMoveCategory:category,firstTurnOut};
   }
+  // When the calculator exposes integer damage in a tooltip/attribute,
+  // use it. Do NOT reconstruct integer HP damage from a rounded percentage.
+  function rawDamageFromText(s){
+    const text=String(s??'').replace(/\s+/g,' ');
+    const patterns=[
+      /(?:damage\s*:?\s*)(\d+)\s*[-–—]\s*(\d+)(?![\d.])/i,
+      /(\d+)\s*[-–—]\s*(\d+)\s*\(\s*\d+(?:\.\d+)?\s*%\s*[-–—]/i,
+      /(?:max\s*damage\s*:?\s*)(\d+)\b/i
+    ];
+    for(let i=0;i<patterns.length;i++){
+      const m=text.match(patterns[i]);if(!m)continue;
+      const n=Number(i===2?m[1]:m[2]);
+      if(Number.isSafeInteger(n)&&n>=0)return n;
+    }
+    return null;
+  }
   function readNativeDamage(doc,i,maxHp){
     const e=doc.getElementById?.('resultDamageR'+(i+1));
     if(!e)return {damage:null,reason:'Missing resultDamageR'+(i+1)};
@@ -773,7 +859,14 @@
       const n=number(e.getAttribute?.(attr));
       if(n!=null&&Number.isInteger(n)&&n>=0)return {damage:n,reason:'Calculator '+attr,exactDisplay:true};
     }
+    for(const source of [e.getAttribute?.('title'),e.getAttribute?.('data-original-title'),
+      e.getAttribute?.('data-damage-range'),e.getAttribute?.('aria-label')]){
+      const raw=rawDamageFromText(source);
+      if(raw!=null)return {damage:raw,reason:'Native integer damage in calculator tooltip',exactDisplay:true};
+    }
     const str=Array.from(e.childNodes||[]).filter(n=>n.nodeType===3).map(n=>n.textContent).join('')||e.textContent||'';
+    const raw=rawDamageFromText(str);
+    if(raw!=null)return {damage:raw,reason:'Native integer damage in damage display',exactDisplay:true};
     return parseDamageDetail(str,maxHp);
   }
   // Return the AI's ONE-STRIKE damage proxy, not the entire hit-count total.
@@ -913,7 +1006,7 @@
     return {state,issues,source:trainer.source};
   }
 
-  return {TYPES,fromSide,readTypes,readAbility,readStatus,readItem,readBoosts,readSpeed,readFormat,readWeather,readTrickRoom,moveMetadata,typeEffectiveness,parseDamage,parseDamageDetail,numeric:number,decodeFlags,readTrainerFlags,readBoolean,readFieldState,readHistory,readAttackOrder,readNativeDamage,readAIDamage,readHitInfo,readBattle};
+  return {TYPES,fromSide,readTypes,readAbility,readStatus,readItem,readBoosts,readSpeed,readFormat,readWeather,readTrickRoom,moveMetadata,typeEffectiveness,parseDamage,parseDamageDetail,numeric:number,decodeFlags,parseVisibleFlagLabels,readVisibleFlagBadges,readTrainerFlags,rawDamageFromText,readBoolean,readFieldState,readHistory,readAttackOrder,readNativeDamage,readAIDamage,readHitInfo,readBattle};
 });
 
 /* Optional battle context that a static damage calculator cannot always know.
@@ -1029,13 +1122,19 @@
 (function(){
   'use strict';
   const doc=document;
-  if(!doc.body||!globalThis.PKAI||!globalThis.PKAICalcAdapter||!globalThis.PKAIContext||doc.getElementById('pkai-context'))return;
+  if(!doc.body||!globalThis.PKAI||!globalThis.PKAICalcAdapter||!globalThis.PKAIContext)return;
+  if(doc.getElementById('pkai-context')?.dataset?.pkaiVersion==='1.2.0')return;
+  // Replace a stale panel from the previous release, if both scripts were loaded.
+  doc.getElementById('pkai-context')?.remove();
   const adapter=globalThis.PKAICalcAdapter,engine=globalThis.PKAI,context=globalThis.PKAIContext;
   const create=(tag,text,cls)=>{
     const n=doc.createElement(tag);if(cls)n.className=cls;
     if(text!=null)n.textContent=String(text);return n;
   };
   const css=create('style');css.textContent=`
+    /* Older v0.6/v0.7 scripts injected legacy HP independently.
+       Make sure it stays invisible even if another cached script recreates it. */
+    .pkai-hp-tools,[data-pkai-hp-tools],.pkai-hp-range,#pkai-launcher,#pkai-dialog{display:none!important}
     .pkai-inline-odds{color:#087e90!important;font-weight:700!important;white-space:nowrap!important;
       font:inherit!important;margin:0 5px!important;display:inline-block!important;float:none!important;
       width:auto!important;max-width:none!important;overflow:visible!important;visibility:visible!important;opacity:1!important;vertical-align:baseline!important}
@@ -1062,10 +1161,23 @@
   `;doc.head.appendChild(css);
   // Remove stale floating UI from an older script version if it is present.
   doc.getElementById('pkai-launcher')?.remove();doc.getElementById('pkai-dialog')?.remove();
+  function removeLegacyControls(){
+    doc.querySelectorAll('.pkai-hp-tools,[data-pkai-hp-tools],.pkai-hp-range').forEach(el=>el.remove());
+    doc.getElementById('pkai-launcher')?.remove();
+    doc.getElementById('pkai-dialog')?.remove();
+  }
+  removeLegacyControls();
   const holders=['resultDamageR1','resultDamageR2','resultDamageR3','resultDamageR4'];
   const key=x=>engine.nameKey(x);
   const overridesBySelection=new Map();
   const manualFlagsBySelection=new Map();
+  // A *clearly labeled hypothetical preview* when the calculator does not
+  // contain trainer AI metadata. It is never presented as the actual flag mask.
+  const ASSUMED_FLAGS={basic:true,evalAtt:true,expert:true,doubles:false,
+    setupFirstTurn:false,risky:false,prioDamage:false,batonPass:false,
+    checkHP:false,weather:false,harassment:false};
+  const flagPreviewDisabled=new Set();
+  function assumedFlags(format){return {...ASSUMED_FLAGS,doubles:format==='Doubles'};}
   let latest=null,refreshing=false,scheduleTimer=null,selectedKey='';
   function selectedSet(root){
     const el=doc.querySelector(root+' .set-selector')||doc.querySelector(root+' .species');
@@ -1103,7 +1215,7 @@
     const result=doc.querySelector('.results-right')||doc.querySelector('.move-result-subgroup')||doc.querySelector('.move-result-group');
     return result?.parentElement||doc.querySelector('#p2')||doc.body;
   }
-  const panel=create('section',null);panel.id='pkai-context';panel.setAttribute('aria-label','AI scoring context');
+  const panel=create('section',null);panel.id='pkai-context';panel.dataset.pkaiVersion='1.2.0';panel.setAttribute('aria-label','AI scoring context');
   contextHost().appendChild(panel);
   function attachPanel(){
     const host=contextHost();if(panel.parentNode!==host)host.appendChild(panel);
@@ -1137,35 +1249,47 @@
     }
     return row;
   }
-  function renderFlags(existingFlags){
+  function renderFlags(existingFlags,format){
     if(existingFlags)return null;
-    const fieldset=create('fieldset');fieldset.appendChild(create('legend','Trainer AI flags (not provided by calc)'));
-    fieldset.appendChild(create('p','Select every enabled flag. Unchecked flags count as disabled after you make a selection. No defaults are assumed.','pkai-help'));
+    const fs=create('fieldset');fs.appendChild(create('legend','Trainer flags: preview assumptions'));
+    fs.appendChild(create('p',
+      'The selected trainer’s exact AI flags were NOT found in this calculator. These are hypothetical move odds, not the trainer’s verified odds. Select the correct flags below if you know them.',
+      'pkai-warning'));
+    const key=flagsKey(), disabled=flagPreviewDisabled.has(key);
+    const controls=create('div',null,'pkai-fields');
+    const preview=create('label');
+    const checkbox=create('input');checkbox.type='checkbox';checkbox.checked=!disabled;
+    checkbox.addEventListener('change',()=>{
+      if(checkbox.checked)flagPreviewDisabled.delete(key);else flagPreviewDisabled.add(key);
+      refreshView();
+    });
+    preview.append(checkbox,doc.createTextNode('Show conditional odds using selected assumptions'));
+    controls.appendChild(preview);
+    const preset=create('button','Reset to Basic + Evaluate Attack + Expert'+(format==='Doubles'?' + Tag Strategy':''),'pkai-reset');
+    preset.type='button';preset.addEventListener('click',()=>{
+      manualFlagsBySelection.set(key,assumedFlags(format));flagPreviewDisabled.delete(key);refreshView();
+    });controls.appendChild(preset);fs.appendChild(controls);
+    const chosen=manualFlagsBySelection.get(key)||assumedFlags(format);
     const list=create('div',null,'pkai-flag-list');
-    const chosen=manualFlagsBySelection.get(flagsKey());
     for(const [flag,label] of Object.entries(context.FLAG_NAMES)){
       const row=create('div',null,'pkai-line');const input=create('input');input.type='checkbox';
-      input.checked=!!chosen?.[flag];input.id='pkai-flag-'+flag;
+      input.checked=!!chosen[flag];input.id='pkai-flag-'+flag;
       const caption=create('label');caption.htmlFor=input.id;caption.append(input,doc.createTextNode(label));row.appendChild(caption);
       input.addEventListener('change',()=>{
-        const next={...(manualFlagsBySelection.get(flagsKey())||Object.fromEntries(context.FLAGS.map(k=>[k,false])))};
-        next[flag]=input.checked;manualFlagsBySelection.set(flagsKey(),next);refreshView();
+        manualFlagsBySelection.set(key,{...chosen,[flag]:input.checked});
+        flagPreviewDisabled.delete(key);refreshView();
       });list.appendChild(row);
     }
-    fieldset.appendChild(list);
-    if(chosen){
-      const reset=create('button','Clear manual flags','pkai-reset');reset.type='button';
-      reset.addEventListener('click',()=>{manualFlagsBySelection.delete(flagsKey());refreshView();});fieldset.appendChild(reset);
-    }
-    return fieldset;
+    fs.appendChild(list);
+    return fs;
   }
   function renderPanel(snapshot,applicable,missing,blockers,result,notes){
     panel.replaceChildren();
     const header=create('div',null,'pkai-header');header.appendChild(create('span','AI scoring context'));
-    header.appendChild(create('span',snapshot.state.flags?'Flags: read from trainer':'Flags: not exposed'));
+    header.appendChild(create('span',snapshot.flagsSource==='native'?'Flags: read from trainer':'Flags: assumed for preview'));
     panel.appendChild(header);
     panel.appendChild(create('div','Move odds appear beside the enemy move damage ranges. Fill in only battle history that the damage calculator does not track.','pkai-help'));
-    const flags=renderFlags(snapshot.state.flags);if(flags)panel.appendChild(flags);
+    const flags=renderFlags(snapshot.flagsSource==='native'?snapshot.state.flags:null,snapshot.state.format);if(flags)panel.appendChild(flags);
     if(applicable.length){
       const groups=new Map();for(const spec of applicable){
         if(!groups.has(spec.group))groups.set(spec.group,[]);
@@ -1228,17 +1352,20 @@
   function refreshView(){
     if(refreshing)return;refreshing=true;
     try{
-      attachPanel();
+      removeLegacyControls();attachPanel();
       selectedKey=selectionKey();
       const snapshot=adapter.readBattle(doc,globalThis);
       const store=overridesBySelection.get(selectedKey)||{};
       const original=snapshot.state;
       // Controls are keyed to the current matchup, not carried across foes.
       let state=context.apply(original,store);
-      const chosen=manualFlagsBySelection.get(flagsKey());
       const notes=[];
-      if(!state.flags && chosen){state={...state,flags:chosen};notes.push('Trainer flags manually selected; not verified from source data.');}
       if(!state.format){state={...state,format:'Singles'};notes.push('Battle format not exposed; treating it as Singles.');}
+      const flagsSource=state.flags?'native':'conditional-preview';
+      if(!state.flags && !flagPreviewDisabled.has(flagsKey())){
+        state={...state,flags:manualFlagsBySelection.get(flagsKey())||assumedFlags(state.format)};
+        notes.push('CONDITIONAL PREVIEW: trainer AI flag mask was not found. The current checkboxes are assumptions, not detected trainer data.');
+      }
       const applicable=context.descriptorsFor(state);
       const unresolved=applicable.filter(x=>inputValue(store,x.id)==null);
       if(unresolved.length)notes.push(unresolved.length+' history/field conditions remain unknown.');
@@ -1246,9 +1373,9 @@
       let result=null;
       if(!blockers.length){try{result=engine.calculate(state);}catch(e){blockers.push(e.message||String(e));}}
       const missing=unresolved.map(x=>x.label+' (not provided by calculator)');
-      latest={snapshot:{...snapshot,state},missing,blockers,result,notes,controls:applicable};
+      latest={snapshot:{...snapshot,state,flagsSource},missing,blockers,result,notes,controls:applicable};
       paintInline(latest.snapshot,result,blockers,notes);
-      renderPanel({...snapshot,state:original},applicable,missing,blockers,result,notes);
+      renderPanel({...snapshot,state:original,flagsSource},applicable,missing,blockers,result,notes);
     }catch(e){
       const error='AI reader error: '+(e?.message||e);
       latest={error};
@@ -1262,6 +1389,11 @@
     for(const m of changes){
       const node=m.target.nodeType===3?m.target.parentElement:m.target;
       if(isOwn(node))continue;
+      // Old userscripts may reinsert a legacy HP control after our initial cleanup.
+      if(node?.matches?.('.pkai-hp-tools,[data-pkai-hp-tools],.pkai-hp-range') ||
+         [...m.addedNodes].some(n=>n.nodeType===1 && (n.matches?.('.pkai-hp-tools,[data-pkai-hp-tools],.pkai-hp-range') || n.querySelector?.('.pkai-hp-tools,[data-pkai-hp-tools],.pkai-hp-range')))){
+        removeLegacyControls();
+      }
       const changed=[...m.addedNodes,...m.removedNodes];
       if(changed.length&&changed.every(n=>n.nodeType===1 &&
         (n.matches?.('.pkai-inline-odds,#pkai-context')||n.closest?.('#pkai-context'))))continue;
@@ -1273,9 +1405,11 @@
   observer.observe(doc.body,{subtree:true,childList:true,characterData:true});
   doc.addEventListener('input',e=>{if(!isOwn(e.target))queue();},true);
   doc.addEventListener('change',e=>{if(!isOwn(e.target))queue();},true);
-  globalThis.PKAIInline={version:'1.0.0',refresh:refreshView,snapshot:()=>latest?.snapshot?.state,
+  globalThis.PKAIInline={version:'1.2.0',refresh:refreshView,snapshot:()=>latest?.snapshot?.state,
     locations:locateInline,diagnostics:()=>latest?.error?[latest.error]:[...(latest?.blockers||[]),...(latest?.missing||[]),...(latest?.notes||[])],
-    controls:()=>latest?.controls||[]};
+    controls:()=>latest?.controls||[],
+    flagSource:()=>latest?.snapshot?.flagsSource,
+    blockers:()=>latest?.blockers||[]};
   refreshView();
 })();
 
