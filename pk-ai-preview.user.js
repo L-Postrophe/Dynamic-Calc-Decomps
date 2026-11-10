@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Platinum Kaizo AI Odds � Inline Damage Results
 // @namespace    https://github.com/hzla/Dynamic-Calc-Decomps
-// @version      0.7.0
-// @description  Fixed inline odds mounting beside damage results; auto-read state and Quick HP.
+// @version      1.0.0
+// @description  Inline AI odds and move-dependent history controls; no floating panel.
 // @match        https://hzla.github.io/Dynamic-Calc-Decomps/*
 // @match        https://hzla.github.io/Dynamic-Calc/*
 // @grant        none
@@ -47,7 +47,7 @@
   const boosting = new Set(['Curse','Dragon Dance','Swords Dance','Nasty Plot','Calm Mind','Bulk Up','Agility','Rock Polish','Iron Defense','Amnesia','Acid Armor','Harden','Double Team','Cosmic Power','Growth','Tail Glow','Howl','Sharpen','Barrier','Defense Curl'].map(nameKey));
   const sleepMoves = new Set(['Hypnosis','Spore','Sleep Powder','GrassWhistle','Sing','Lovely Kiss','Dark Void','Yawn'].map(nameKey));
   const directStatus = new Set(['Hypnosis','Spore','Sleep Powder','GrassWhistle','Sing','Lovely Kiss','Dark Void','Yawn','Toxic','Thunder Wave','Will-O-Wisp','Stun Spore','PoisonPowder','Glare'].map(nameKey));
-  const prioVerified = new Set(['Curse','Dragon Dance','Calm Mind','Light Screen','Hypnosis','Agility','Aqua Ring','Hail'].map(nameKey));
+  const prioVerified = new Set(['Explosion','Selfdestruct','Curse','Dragon Dance','Calm Mind','Light Screen','Hypnosis','Agility','Aqua Ring','Hail'].map(nameKey));
   const batonVerified = new Set(['Curse','Dragon Dance','Calm Mind','Light Screen','Hypnosis','Agility','Aqua Ring','Hail'].map(nameKey));
   const statusVerifiedExpert = new Set(['Curse','Dragon Dance','Calm Mind','Light Screen','Reflect','Hypnosis','Agility','Rock Polish','Swords Dance','Nasty Plot','Stealth Rock','Tailwind','Pluck','Iron Head','Earthquake','Rock Slide','Yawn','Recover','Roost','Aqua Ring','Hail'].map(nameKey));
   const clamp = (n, lo, hi) => Math.max(lo,Math.min(hi,n));
@@ -89,7 +89,20 @@
         (type==='Fire'&&foe.ability==='Flash Fire') ||
         (atk&&foe.ability==='Wonder Guard'&&eff<2)
       );
-      if(atk && (immuneByType||abilityImmune)) add(-10,'Basic: type or ability immunity');
+      if(k==='explosion'||k==='selfdestruct') {
+        // Platinum Kaizo Explosion page: this effect is not scored by normal
+        // highest-damage logic. Basic uses its own branch, which terminates.
+        if(immuneByType) add(-10,'Basic: Explosion immune target');
+        else if(foe.ability==='Wonder Guard' && state.ability!=='Mold Breaker' && eff!==2 && eff!==4)
+          add(-12,'Basic: Explosion blocked by Wonder Guard');
+        else if(foe.ability==='Damp' && state.ability!=='Mold Breaker')add(-10,'Basic: Damp stops Explosion');
+        else if(state.partyHasReserve===true) { /* No Basic penalty */ }
+        else if(state.partyHasReserve===false){
+          if(foe.hasReserves===true) add(-10,'Basic: last AI mon, opponent has reserves');
+          else if(foe.hasReserves===false) add(-1,'Basic: both sides on last mon');
+          else omissions.push('Explosion Basic needs opponent reserve count');
+        } else omissions.push('Explosion Basic needs AI reserve count');
+      } else if(atk && (immuneByType||abilityImmune)) add(-10,'Basic: type or ability immunity');
       const blockedStatus=status(foe.status)||!!foe.safeguard;
       if(sleepMoves.has(k)&&(blockedStatus||['Insomnia','Vital Spirit'].includes(foe.ability)))
         add(-10,'Basic: sleep blocked');
@@ -142,12 +155,32 @@
           if(damage<maxDamage) add(-1,'Eval Att: lower damage than another move');
           else if(eff>=4) prob(2,P(176),'Eval Att: 4x effectiveness');
         }
+      } else if(atk && (k==='explosion'||k==='selfdestruct')) {
+        // The damage-check routine returns zero for Explosion/Selfdestruct.
+        // It receives its own probabilistic Eval Att penalty, never KO +4.
+        prob(-2,P(205),'Eval Att: Explosion special-case penalty');
+        if(eff===4)prob(2,P(176),'Eval Att: Explosion 4x effectiveness');
       } else if(atk) omissions.push('Eval Att special-case damage move '+move.name);
       else if(eff===4) prob(2,P(176),'Eval Att: 4x status-type quirk');
     }
     // EXPERT: Exact rules for the listed move pages only.
     if(flags.expert) {
-      if(k==='curse') {
+      if(k==='explosion'||k==='selfdestruct') {
+        const evasion=Number(foe.stages?.evasion||0);
+        if(evasion>=1)add(-1,'Expert: opponent evasion boosted');
+        if(evasion>=3)prob(-1,.5,'Expert: opponent evasion +3 or above');
+        if(selfpct<80||foe.userSlower===true){
+          if(selfpct>50)prob(-1,P(206),'Expert: Explosion at HP over 50%');
+          else {
+            prob(1,.5,'Expert: Explosion below 51% HP');
+            if(selfpct<31)prob(1,P(206),'Expert: Explosion below 31% HP');
+          }
+        }else if(foe.userSlower===false || selfpct>=80){
+          prob(-3,P(206),'Expert: early Explosion while healthy');
+          if(foe.userSlower===null && selfpct>=80)
+            omissions.push('Explosion Expert: unknown attack order can alter this rule');
+        }
+      } else if(k==='curse') {
         if(isGhost) { if(selfpct<81)add(-1,'Expert: ghost Curse low HP'); }
         else if(stage('def')<4) {
           if(state.moves.some(m=>group(m.name,['Gyro Ball','Trick Room']))) {
@@ -218,7 +251,7 @@
     }
     // DOUBLES vs opponent: only priority + effectiveness route; partner-specific EQ penalty.
     if(flags.doubles && targets.length===2) {
-      if(atk) {
+      if(atk && k!=='explosion' && k!=='selfdestruct') {
         if(damage<hp && state.allyAlive!==false && (eff===0.5||eff===0.25))
           prob(eff===0.5?-1:-2,P(192),'Doubles: resisted damage');
         const allyDamages=state.allyMoveDamages?.[targetIndex]||[];
@@ -260,14 +293,32 @@
     }
     if(flags.setupFirstTurn&&state.firstTurn&&firstTurnEligible.has(k))prob(2,P(176),'Setup First Turn');
     if(flags.risky) {
-      if(group(k,['Hypnosis','Spore','Sleep Powder','Yawn','Confuse Ray','Swagger','Counter','Mirror Coat','Metal Burst','Fissure','Guillotine','Horn Drill','Sheer Cold','Sucker Punch','Focus Punch','Destiny Bond','Belly Drum'])) prob(2,.5,'Risky');
+      if(group(k,['Explosion','Selfdestruct','Hypnosis','Spore','Sleep Powder','Yawn','Confuse Ray','Swagger','Counter','Mirror Coat','Metal Burst','Fissure','Guillotine','Horn Drill','Sheer Cold','Sucker Punch','Focus Punch','Destiny Bond','Belly Drum'])) prob(2,.5,'Risky');
       else if(!genericAttack.has(k) && !boosting.has(k))omissions.push('Risky move eligibility unverified: '+move.name);
     }
     if(flags.prioDamage) {
       if(prioVerified.has(k))prob(2,P(156),'Prio Damage');
       else if(!genericAttack.has(k)) omissions.push('Prio Damage unverified: '+move.name);
     }
-    if(flags.batonPass && batonVerified.has(k) && state.partyHasReserve!==false) {
+    if(flags.batonPass && (k==='explosion'||k==='selfdestruct')) {
+      if(state.partyHasReserve===false){ /* no scoring */ }
+      else if(state.partyHasReserve==null)omissions.push('Explosion Baton Pass needs AI reserve count');
+      else {
+        const hasBP=state.moves.some(m=>nameKey(m.name)==='batonpass');
+        const reach=hasBP?1:1-P(79);
+        const first=state.firstTurn===true;
+        if(state.firstTurn==null)omissions.push('Explosion Baton Pass needs battle turn');
+        if(first){
+          const tail=selfpct<60?-10:1;
+          branch([[0,1-reach],[8,reach*P(237)],[tail,reach*(1-P(237))]],
+            'Baton Pass: Explosion first turn');
+        } else {
+          const tail=selfpct<60?-10:1;
+          branch([[0,1-reach],[3+tail,reach*P(237)],[tail,reach*(1-P(237))]],
+            'Baton Pass: Explosion later turn');
+        }
+      }
+    } else if(flags.batonPass && batonVerified.has(k) && state.partyHasReserve!==false) {
       const hasBP=state.moves.some(m=>nameKey(m.name)==='batonpass');
       const go=hasBP?1:(k==='dragondance'?1-P(81):1-P(79));
       if(k==='dragondance'){
@@ -278,7 +329,13 @@
         branch([[0,1-go],[main,go*p],[selfpct<60?-10:1,go*(1-p)]], 'Baton Pass: possible setup or HP penalty');
       }
     }else if(flags.batonPass&&!batonVerified.has(k)&&boosting.has(k))omissions.push('Baton Pass flag for '+move.name+' not verified');
-    if(flags.checkHP) {
+    if(flags.checkHP && (k==='explosion'||k==='selfdestruct')) {
+      const userHigh=selfpct>30, targetLow=foepct<31;
+      // A successful first -2 check terminates this flag; subsequent checks
+      // run only if it fails. Therefore the penalties do not stack.
+      const p=userHigh?(targetLow?1-(1-P(206))**2:P(206)):(targetLow?P(206):0);
+      if(p)prob(-2,p,'Check HP: Explosion suicide timing');
+    } else if(flags.checkHP) {
       // Sequential checks: the second roll occurs ONLY if the first did not score -2.
       const userLow=group(k,['Dragon Dance','Agility','Rock Polish','Calm Mind','Swords Dance','Nasty Plot','Bulk Up']) && selfpct<70;
       const targetLow=group(k,['Dragon Dance','Agility','Rock Polish','Calm Mind','Swords Dance','Nasty Plot','Bulk Up']) && foepct<71;
@@ -447,7 +504,26 @@
   // An unrecognized move is left unknown, not silently classed as Physical.
   const STATUS=new Set(('Acid Armor,Agility,Amnesia,Aqua Ring,Attract,Baton Pass,Belly Drum,Block,Bulk Up,Calm Mind,Charm,Confuse Ray,Cosmic Power,Curse,Defend Order,Defog,Destiny Bond,Detect,Disable,Double Team,Dragon Dance,Embargo,Encore,Endure,FeatherDance,Flash,Focus Energy,Follow Me,Glare,Growth,Hail,Harden,Haze,Heal Bell,Helping Hand,Howl,Hypnosis,Imprison,Ingrain,Iron Defense,Leech Seed,Light Screen,Lock-On,Lovely Kiss,Lucky Chant,Magic Coat,Magnet Rise,Mean Look,Memento,Metal Sound,Milk Drink,Minimize,Mist,Moonlight,Morning Sun,Nasty Plot,Nightmare,Odor Sleuth,Pain Split,Perish Song,Poison Gas,PoisonPowder,Protect,Psych Up,Rain Dance,Recover,Reflect,Refresh,Rest,Roar,Rock Polish,Role Play,Roost,Safeguard,Sand-Attack,Sandstorm,Scary Face,Screech,Sharpen,Sing,Skill Swap,Sleep Powder,Sleep Talk,Slack Off,Smokescreen,Softboiled,Spikes,Spite,Spore,Stealth Rock,String Shot,Stun Spore,Substitute,Sunny Day,Supersonic,Swagger,Sweet Kiss,Sweet Scent,Swords Dance,Synthesis,Tail Glow,Tail Whip,Tailwind,Taunt,Teeter Dance,Thunder Wave,Tickle,Torment,Toxic,Toxic Spikes,Trick,Trick Room,Will-O-Wisp,Wish,Withdraw,Worry Seed,Yawn').split(',').map(x=>x.toLowerCase().replace(/[^a-z0-9]/g,'')));
   const SPECIAL=new Set(('Air Cutter,Air Slash,Aura Sphere,Aurora Beam,Blizzard,Bubble,BubbleBeam,Bug Buzz,Charge Beam,Dark Pulse,Discharge,Draco Meteor,Dragon Pulse,DragonBreath,Earth Power,Energy Ball,Extrasensory,Fire Blast,Fire Spin,Flamethrower,Flash Cannon,Focus Blast,Giga Drain,Grass Knot,Heat Wave,Hidden Power,Hydro Cannon,Hydro Pump,Hyper Beam,Ice Beam,Icy Wind,Lava Plume,Leaf Storm,Magical Leaf,Muddy Water,Ominous Wind,Overheat,Psychic,Psybeam,Shadow Ball,Shock Wave,Signal Beam,Sludge Bomb,Sludge Wave,SolarBeam,Spacial Rend,Surf,Swift,Thunder,Thunderbolt,Tri Attack,Twister,Vacuum Wave,Water Pulse,Water Spout,Weather Ball,Whirlpool,Zap Cannon').split(',').map(x=>x.toLowerCase().replace(/[^a-z0-9]/g,'')));
-  const PHYSICAL=new Set(('Aerial Ace,Aqua Jet,Aqua Tail,Avalanche,Bite,Body Slam,Brick Break,Bug Bite,Bullet Punch,Close Combat,Counter,Crunch,Dig,Double-Edge,Dragon Claw,Dragon Rush,Earthquake,Explosion,ExtremeSpeed,Facade,Fake Out,Fire Fang,Fire Punch,Flare Blitz,Focus Punch,Giga Impact,Head Smash,Ice Fang,Ice Punch,Ice Shard,Iron Head,Iron Tail,Knock Off,Low Kick,Mach Punch,Mega Kick,Megahorn,Metal Claw,Night Slash,Outrage,Payback,Pluck,Poison Jab,Pursuit,Quick Attack,Razor Leaf,Return,Reversal,Rock Slide,Rock Tomb,Shadow Claw,Shadow Sneak,Stone Edge,Struggle,Substitute,Sucker Punch,Superpower,Tackle,Take Down,Thunder Fang,ThunderPunch,Trick Room,U-turn,Volt Tackle,Waterfall,Wood Hammer,X-Scissor,Zen Headbutt').split(',').map(x=>x.toLowerCase().replace(/[^a-z0-9]/g,'')));
+  const PHYSICAL=new Set(('Aerial Ace,Aqua Jet,Aqua Tail,Avalanche,Bite,Body Slam,Brick Break,Bug Bite,Bullet Punch,Close Combat,Counter,Crunch,Dig,Double-Edge,Dragon Claw,Dragon Rush,Earthquake,Explosion,ExtremeSpeed,Facade,Fake Out,Fire Fang,Fire Punch,Flare Blitz,Focus Punch,Giga Impact,Head Smash,Ice Fang,Ice Punch,Ice Shard,Iron Head,Iron Tail,Knock Off,Low Kick,Mach Punch,Mega Kick,Megahorn,Metal Claw,Night Slash,Outrage,Payback,Pluck,Poison Jab,Pursuit,Quick Attack,Razor Leaf,Return,Reversal,Rock Slide,Rock Tomb,Shadow Claw,Shadow Sneak,Stone Edge,Struggle,Substitute,Sucker Punch,Superpower,Tackle,Take Down,Thunder Fang,ThunderPunch,Trick Room,U-turn,Volt Tackle,Waterfall,Wood Hammer,X-Scissor,Zen Headbutt,Double Hit,Double Kick,Bonemerang,Twineedle,DoubleSlap,Fury Swipes,Fury Attack,Bullet Seed,Rock Blast,Icicle Spear,Pin Missile,Bone Rush,Arm Thrust,Comet Punch,Barrage,Spike Cannon,Tail Slap,Triple Kick,Triple Axel').split(',').map(x=>x.toLowerCase().replace(/[^a-z0-9]/g,'')));
+  // Platinum Kaizo AI damage comparisons evaluate exactly ONE hit of a multistrike move.
+  // Fixed-count and 2–5-hit moves can be inferred from the normal damage display,
+  // albeit only approximately if the calc reports a rounded TOTAL.
+  const HIT_COUNTS={
+    doublehit:[2,2],doublekick:[2,2],bonemerang:[2,2],twineedle:[2,2],
+    doubleslap:[2,5],furyswipes:[2,5],furyattack:[2,5],bulletseed:[2,5],
+    rockblast:[2,5],iciclespear:[2,5],pinmissile:[2,5],bonerush:[2,5],
+    armthrust:[2,5],cometpunch:[2,5],barrage:[2,5],spikecannon:[2,5],
+    tailslap:[2,5],
+    triplekick:[3,3],tripleaxel:[3,3]
+  };
+  const NONUNIFORM_HITS=new Set(['triplekick','tripleaxel']);
+  function readHitInfo(name,raw){
+    const k=key(name), hits=raw?.multihit ?? raw?.multiHit ?? raw?.hits ?? HIT_COUNTS[k];
+    if(!hits)return null;
+    const arr=Array.isArray(hits)?hits:[hits,hits];
+    if(arr.length<2||arr.some(n=>!Number.isInteger(Number(n))||Number(n)<2||Number(n)>10))return null;
+    return {min:Number(arr[0]),max:Number(arr[1]),nonuniform:NONUNIFORM_HITS.has(k)};
+  }
   const PRIORITY={'quickattack':1,'machpunch':1,'bulletpunch':1,'aquajet':1,'iceshard':1,'shadowsneak':1,'suckerpunch':1,'extremespeed':1,'fakeout':1,'vacuumwave':1,'feint':2,'protect':3,'detect':3,'endure':3,'helpinghand':5,'followme':3,'roar':-6,'whirlwind':-6,'trickroom':-7,'counter':-5,'mirrorcoat':-5,'metalburst':0};
   const key=x=>normalize(x).toLowerCase().replace(/[^a-z0-9]/g,'');
   function moveMetadata(doc,index,side='R',globals={}){
@@ -460,7 +536,7 @@
     const category=dataCategory||(STATUS.has(k)?'Status':SPECIAL.has(k)?'Special':PHYSICAL.has(k)?'Physical':null);
     const pri=Number.isInteger(raw?.priority)?raw.priority:PRIORITY[k]??0;
     const specialStatus=category==='Status';
-    return {name,category,type:moveType||typeName(raw?.type),basePower:bp,priority:pri,source:dataCategory?'native':category?'reference':'unknown',isStatus:specialStatus};
+    return {name,category,type:moveType||typeName(raw?.type),basePower:bp,priority:pri,hitInfo:readHitInfo(name,raw),source:dataCategory?'native':category?'reference':'unknown',isStatus:specialStatus};
   }
   // Gen 4 type chart: attack -> [super effective, resisted, immune].
   const CHART={
@@ -500,7 +576,9 @@
     const lower=Math.max(0,Math.ceil((pct-epsilon)*maxHp/100-1e-9));
     const upper=Math.floor((pct+epsilon)*maxHp/100+1e-9);
     if(lower===upper)return {damage:lower,reason:'Inferred unique max HP damage from rounded display',percentage:pct,exactDisplay:true};
-    return {damage:null,reason:`Ambiguous rounded damage (${lower}–${upper} HP)`,percentage:pct,range:[lower,upper]};
+    // Do not erase a known numerical interval: the scoring UI can show a
+    // conditional estimate using the middle integer (never label it exact).
+    return {damage:null,estimatedDamage:Math.round((lower+upper)/2),reason:`Ambiguous rounded damage (${lower}–${upper} HP)`,percentage:pct,range:[lower,upper],approximate:true};
   }
   function parseDamage(text,maxHp){return parseDamageDetail(text,maxHp).damage;}
   // Values below are read from the *calculator*, never from an extension form.
@@ -533,7 +611,7 @@
       return Object.fromEntries(FLAG_KEYS.map(k=>[k,flagSynonyms[k].some(n=>found.includes(n))]));
     }
     const s=String(source).trim();
-    if(/^\d+$/.test(s)){
+    if(/^(?:0x[0-9a-f]+|\d+)$/i.test(s)){
       const mask=Number(s);
       if(!Number.isSafeInteger(mask)||mask<0||mask>=2**FLAG_KEYS.length)return null;
       return Object.fromEntries(FLAG_KEYS.map((k,i)=>[k,!!(mask&(1<<i))]));
@@ -545,31 +623,112 @@
     if(!keys.length||keys.some(k=>!FLAG_KEYS.some(f=>flagSynonyms[f].includes(k))))return null;
     return Object.fromEntries(FLAG_KEYS.map(k=>[k,flagSynonyms[k].some(n=>keys.includes(n))]));
   }
+  // Trainer flags are saved with trainer data, not inferred from a Pokémon's
+  // moves or the flags commonly used by other trainers. In particular, an
+  // unannotated set is NOT evidence for Basic/Expert/Eval Att being enabled.
+  const TRAINER_FLAG_PROPERTIES=[
+    'aiFlags','ai_flags','aiflags','aiMask','ai_mask','aiBits','ai_bits',
+    'trainerAiFlags','trainer_ai_flags','trainerAI','trainerAi','aiFlagsMask',
+    'ai','AI','aiValue','ai_value','aiFlagValue'
+  ];
+  function flagsOnObject(entry){
+    if(!entry || typeof entry!=='object')return null;
+    // Never decode an arbitrary number or an unrelated `.flags` property as
+    // trainer flags: it might be a UI flags field or a Pokémon's IV mask.
+    for(const key of TRAINER_FLAG_PROPERTIES){
+      if(entry[key]==null)continue;
+      const flags=decodeFlags(entry[key]);
+      if(flags)return flags;
+    }
+    // A complete, explicitly named object is also permitted.
+    if(FLAG_KEYS.every(k=>Object.keys(entry).some(n=>flagSynonyms[k].includes(flatKey(n)))))
+      return decodeFlags(entry);
+    return null;
+  }
   function readTrainerFlags(doc,globals={}){
-    const nodes=['#p2 [data-ai-flags]','#p2 [data-ai-mask]','.trainer-pok-list .selected[data-ai-flags]',
-      '#ai-container [data-ai-flags]','[data-trainer-ai-flags]','#ai-flags','#trainer-ai-flags'];
-    for(const selector of nodes){
+    const explicit=[
+      '#p2[data-ai-flags]','#p2[data-ai-mask]',
+      '#p2 [data-ai-flags]','#p2 [data-ai-mask]',
+      '#p2 [data-trainer-ai-flags]',
+      '.trainer-pok-list .selected[data-ai-flags]',
+      '.trainer-pok-list .selected[data-ai-mask]',
+      '#ai-container [data-ai-flags]',
+      '[data-current-trainer-ai-flags]',
+      '#ai-flags','#trainer-ai-flags','#trainer-ai-mask'
+    ];
+    for(const selector of explicit){
       const e=doc.querySelector(selector);if(!e)continue;
-      for(const v of [e.getAttribute?.('data-ai-flags'),e.getAttribute?.('data-ai-mask'),e.getAttribute?.('data-trainer-ai-flags'),val(e)]){
-        const f=decodeFlags(v);if(f)return {flags:f,source:'calc DOM '+selector};
+      for(const attr of ['data-ai-flags','data-ai-mask','data-trainer-ai-flags','data-current-trainer-ai-flags']){
+        const f=decodeFlags(e.getAttribute?.(attr));
+        if(f)return {flags:f,source:'selected trainer DOM '+selector+' '+attr};
+      }
+      // Only these expressly flagged nodes may store the value as text.
+      if(['#ai-flags','#trainer-ai-flags','#trainer-ai-mask'].includes(selector)){
+        const f=decodeFlags(val(e));if(f)return {flags:f,source:'selected trainer DOM '+selector};
       }
     }
-    const raw=doc.querySelector('#p2 .set-selector')?.value?.trim();
-    const stores=['SETDEX','SETDEX_BW','setdex','TRAINERS','trainers','trainerData','trainerSets','SETDEX_SM'];
-    for(const key of stores){
-      const data=globals[key];if(!data || typeof data!=='object')continue;
-      const candidates=[];
-      if(raw && Object.hasOwn(data,raw))candidates.push(data[raw]);
-      // Many Showdown calc data sets store species -> named set, not named set -> species.
-      const species=select(doc,['#p2 .set-selector','#p2 .species']);
-      if(species&&data[species]){
-        candidates.push(data[species]);
-        if(raw&&data[species]?.[raw])candidates.push(data[species][raw]);
+    const selector=doc.querySelector('#p2 .set-selector');
+    const selection=String(selector?.value||'').trim();
+    const selectedOption=selector?.selectedOptions?.[0] ||
+      doc.querySelector('#p2 .set-selector option:checked');
+    for(const [element,label] of [[selectedOption,'selected set option'],
+      [doc.querySelector('.trainer-pok-list .selected'),'selected trainer Pokémon']]){
+      if(!element)continue;
+      for(const attr of ['data-ai-flags','data-ai-mask','data-trainer-ai-flags']){
+        const f=decodeFlags(element.getAttribute?.(attr));
+        if(f)return {flags:f,source:label+' '+attr};
       }
-      for(const c of candidates){const f=decodeFlags(c);if(f)return {flags:f,source:'calc data '+key};}
+      const f=flagsOnObject(element.dataset);
+      if(f)return {flags:f,source:label+' dataset'};
+    }
+    // A calc with a trainer-AI integration may already expose the currently
+    // selected trainer object. Use that first because it is unambiguous.
+    const currentStores=['currentTrainer','CURRENT_TRAINER','selectedTrainer',
+      'currentTrainerData','currentTrainerInfo','selectedTrainerData',
+      'activeTrainer','activeTrainerData','trainerAIState'];
+    for(const key of currentStores){
+      const f=flagsOnObject(globals[key]);
+      if(f)return {flags:f,source:'calculator current trainer '+key};
+    }
+    // Look in currently loaded team/set data for an EXACT set match, rather
+    // than using a similarly named trainer or a global default mask.
+    const names=[selection,String(selectedOption?.textContent||'').trim()]
+      .filter(Boolean).map(x=>flatKey(x));
+    const selectedId=[selector?.dataset?.trainerId,
+      selectedOption?.dataset?.trainerId,
+      doc.querySelector('.trainer-pok-list .selected')?.dataset?.trainerId]
+      .filter(Boolean).map(String);
+    const dataStores=['customSets','CUSTOM_SETS','SETDEX','SETDEX_BW','SETDEX_SM',
+      'setdex','TRAINERS','trainers','trainerData','trainerSets','gameData',
+      'calcData','sourceData','CALC_DATA','pkData'];
+    const exactKey=k=>names.includes(flatKey(k)) || selectedId.includes(String(k));
+    for(const storeName of dataStores){
+      const store=globals[storeName];
+      if(!store||typeof store!=='object')continue;
+      // A trainer record directly keyed by ID/name.
+      for(const [k,v] of Object.entries(store)){
+        if(exactKey(k)){
+          const f=flagsOnObject(v);
+          if(f)return {flags:f,source:`calculator ${storeName}[${k}]`};
+        }
+      }
+      // Typical Showdown data: species -> named trainer set -> mon data.
+      // Read only matching set names, never a randomly selected Pokémon set.
+      let examined=0;
+      for(const group of Object.values(store)){
+        if(!group||typeof group!=='object')continue;
+        if(++examined>10000)break;
+        for(const [k,v] of Object.entries(group)){
+          if(!exactKey(k))continue;
+          let f=flagsOnObject(v);
+          if(!f && typeof v==='object')f=flagsOnObject(v.trainer);
+          if(f)return {flags:f,source:`calculator ${storeName} selected set ${k}`};
+        }
+      }
     }
     return {flags:null,source:null};
   }
+
   function readBoolean(doc,selectors){
     for(const selector of selectors){
       const e=doc.querySelector(selector);if(!e)continue;
@@ -616,6 +775,38 @@
     }
     const str=Array.from(e.childNodes||[]).filter(n=>n.nodeType===3).map(n=>n.textContent).join('')||e.textContent||'';
     return parseDamageDetail(str,maxHp);
+  }
+  // Return the AI's ONE-STRIKE damage proxy, not the entire hit-count total.
+  // The underlying game applies integer rounding per strike, so deriving a
+  // one-hit value from a total is necessarily approximate. Native AI/per-hit
+  // data attributes take precedence over this fallback.
+  function readAIDamage(doc,index,maxHp,hitInfo){
+    const e=doc.getElementById?.('resultDamageR'+(index+1));
+    if(e)for(const attr of ['data-ai-one-hit-damage','data-ai-single-hit-damage','data-single-hit-max-damage','data-ai-max-damage']){
+      const n=number(e.getAttribute?.(attr));
+      if(n!==null&&Number.isInteger(n)&&n>=0)
+        return {damage:n,reason:'Native AI one-strike damage from '+attr,approximate:false,perHit:!!hitInfo};
+    }
+    const ordinary=readNativeDamage(doc,index,maxHp);
+    // If the native calculator explicitly labels its result as per-hit, do not
+    // divide it again.  Older calculator versions usually display TOTAL damage.
+    const mode=e?.getAttribute?.('data-hit-damage-mode') || '';
+    const text=e?.textContent||'';
+    if(hitInfo && (/^per[- ]?hit$/i.test(mode)||/\bper[- ]hit\b/i.test(text))){
+      return {...ordinary,damage:ordinary.damage??ordinary.estimatedDamage??null,
+        approximate:!!ordinary.approximate,perHit:true,reason:'Calculator explicitly reports damage per hit'};
+    }
+    if(!hitInfo)return {...ordinary,approximate:!!ordinary.approximate,perHit:false};
+    const total=ordinary.damage??ordinary.estimatedDamage;
+    if(total===null||total===undefined)return {...ordinary,perHit:true};
+    // Displayed max total corresponds to max hit count. For Triple Kick and
+    // Triple Axel the three hits have different base powers, so equal
+    // division is incorrect; use 1/(1+2+3) only as a flagged estimate.
+    const divisor=hitInfo.nonuniform?6:hitInfo.max;
+    const perHit=Math.max(0,Math.round(total/divisor));
+    return {damage:perHit,perHit:true,approximate:true,total,hitCount:hitInfo,
+      reason:`Estimated ONE hit from ${total} total damage ÷ ${divisor} (${hitInfo.min}–${hitInfo.max} hits; rounded display)`,
+      range:ordinary.range};
   }
   function readAttackOrder(doc,side='R',target='L'){
     const a=readSpeed(doc,side),b=readSpeed(doc,target);
@@ -666,23 +857,34 @@
     if(doubles && (!(second?.hp!=null&&second?.maxHp!=null&&second?.types?.length)||!ally?.types?.length))
       note('Doubles board','Calculator does not expose all four active Pokémon');
     const targets=[{...opponent,types:playerTypes,ability:readAbility(doc,'L'),
-      status:readStatus(doc,'L'),name:select(doc,['#p1 .set-selector','#p1 .species'])||'Opponent A',
+      status:readStatus(doc,'L'),stages:readBoosts(doc,'L'),name:select(doc,['#p1 .set-selector','#p1 .species'])||'Opponent A',
       lastMoveCategory:readHistory(doc,'L').lastMoveCategory,safeguard:field.foe.safeguard,
       userSlower:readAttackOrder(doc,'R','L').userSlower}];
     if(doubles)targets.push({...(second||{}),name:second?.name||'Opponent B',
-      lastMoveCategory:readHistory(doc,'L',2).lastMoveCategory,
+      stages:readBoosts(doc,'L',2),lastMoveCategory:readHistory(doc,'L',2).lastMoveCategory,
       userSlower:readAttackOrder(doc,'R','L2').userSlower});
     const moves=Array.from({length:4},(_,i)=>{
       const meta=moveMetadata(doc,i,'R',globals);
-      const move={...meta,damage:[],effectiveness:[]};
+      const move={...meta,damage:[],effectiveness:[],damageNotes:[]};
       if(!meta.name||['none','nomove','loading','loading...'].includes(flatKey(meta.name)))return {name:'(No Move)',category:'Status',type:null,damage:[],effectiveness:[],priority:0};
       for(let t=0;t<targets.length;t++){
         const target=targets[t];
         move.effectiveness[t]=meta.type&&target.types?.length?typeEffectiveness(meta.type,target.types):null;
         if(meta.category==='Status'){move.damage[t]=0;continue;}
+        if(['explosion','selfdestruct'].includes(flatKey(meta.name))){
+          // Explosion is not merely a high-damage hit in Gen 4 AI scoring.
+          // The ordinary AI damage check returns 0 and is explicitly excluded
+          // from comparisons. Use separate Explosion AI scoring routines.
+          move.damage[t]=0;
+          move.damageNotes[t]={damage:0,approximate:false,
+            reason:'Explosion is excluded from the AI damage comparison; scored by special routines'};
+          continue;
+        }
         if(t===0){
-          const d=readNativeDamage(doc,i,target.maxHp);
-          move.damage[t]=d.damage;if(d.damage===null)note(`${meta.name} damage`,d.reason);
+          const d=readAIDamage(doc,i,target.maxHp,meta.hitInfo);
+          move.damage[t]=d.damage??d.estimatedDamage??null;
+          move.damageNotes[t]=d;
+          if(d.damage===null || d.approximate)note(`${meta.name} damage`,d.reason);
         }else{
           // No second-target damage in the standard two-panel calculator.
           move.damage[t]=null;
@@ -705,372 +907,375 @@
       allyAbility:ally?.ability||null,allyMoves:ally?.moves||null,
       allyMagnetRise:doubles?readBoolean(doc,['#magnetRiseR2','#p2-2 .magnet-rise']):null,
       noTargetReserves:readBoolean(doc,['#noTargetReservesL','#p1 [data-no-reserves]']),
+      partyHasReserve:readBoolean(doc,['#p2 [data-party-has-reserve]','#ai-party-has-reserve']),
       targets,moves
     };
     return {state,issues,source:trainer.source};
   }
 
-  return {TYPES,fromSide,readTypes,readAbility,readStatus,readItem,readBoosts,readSpeed,readFormat,readWeather,readTrickRoom,moveMetadata,typeEffectiveness,parseDamage,parseDamageDetail,numeric:number,decodeFlags,readTrainerFlags,readBoolean,readFieldState,readHistory,readAttackOrder,readNativeDamage,readBattle};
+  return {TYPES,fromSide,readTypes,readAbility,readStatus,readItem,readBoosts,readSpeed,readFormat,readWeather,readTrickRoom,moveMetadata,typeEffectiveness,parseDamage,parseDamageDetail,numeric:number,decodeFlags,readTrainerFlags,readBoolean,readFieldState,readHistory,readAttackOrder,readNativeDamage,readAIDamage,readHitInfo,readBattle};
 });
 
-/* Quick HP controls embedded into Dynamic Calc's existing Current HP rows.
- * The native .current-hp input remains the only source of truth: never keep
- * an independent HP override in the AI scorer or local storage.
+/* Optional battle context that a static damage calculator cannot always know.
+ * Only expose controls if selected moves or enabled AI flags may use them.
+ * Explicit unknown is different from false; no guesses are supplied.
  */
-(function (root, factory) {
+(function(root, factory) {
   const api=factory();
-  if(typeof module==='object'&&module.exports)module.exports=api;
-  root.PKAIHPControls=api;
+  if(typeof module==='object' && module.exports) module.exports=api;
+  root.PKAIContext=api;
 })(typeof globalThis!=='undefined'?globalThis:this,function(){
   'use strict';
-  const slots=[
-    {id:'p1',side:'L',index:1,label:'Your Pokémon'},
-    {id:'p2',side:'R',index:1,label:'Enemy Pokémon'},
-    {id:'p1-2',side:'L',index:2,label:'Your second Pokémon'},
-    {id:'p2-2',side:'R',index:2,label:'Enemy second Pokémon'}
-  ];
-  function findNativeInput(doc,slot){
-    const root=doc.getElementById(slot.id);
-    if(!root)return null;
-    return root.querySelector('.hp-cntrl input.current-hp')||
-      root.querySelector('.hp-cntrl #currentHp'+slot.side+slot.index)||
-      root.querySelector('.hp-cntrl input[id^="currentHp"]');
-  }
-  function clampHP(value,maxHp){
-    if(!Number.isInteger(maxHp)||maxHp<=0)return null;
-    if(value===''||value==null||!Number.isFinite(Number(value)))return null;
-    return Math.max(0,Math.min(maxHp,Math.round(Number(value))));
-  }
-  function writeNativeHP(input,value,maxHp,EventType=Event){
-    const hp=clampHP(value,maxHp);
-    if(!input||hp==null)return false;
-    if(String(input.value)===String(hp))return true;
-    input.value=String(hp);
-    // Trigger the calculator's own HP -> percent -> damage update handlers.
-    input.dispatchEvent(new EventType('input',{bubbles:true}));
-    input.dispatchEvent(new EventType('change',{bubbles:true}));
-    return true;
-  }
-  function create(doc,tag,className,text){
-    const el=doc.createElement(tag);el.className=className;
-    if(text!=null)el.textContent=String(text);
-    return el;
-  }
-  function addHPControls(doc,adapter,onChange=()=>{}){
-    const map=new Map();
-    for(const slot of slots){
-      const root=doc.getElementById(slot.id);
-      const native=findNativeInput(doc,slot);
-      const container=root?.querySelector('.hp-cntrl');
-      if(!container||!native)continue; // No disconnected fallback HP field.
-      let bar=container.querySelector('[data-pkai-hp-tools="'+slot.id+'"]');
-      if(bar){map.set(slot.id,{slot,bar,native,sync:bar.pkaiSync});continue;}
-      bar=create(doc,'div','pkai-hp-tools');bar.dataset.pkaiHpTools=slot.id;
-      bar.setAttribute('role','group');bar.setAttribute('aria-label',slot.label+' HP quick adjustment');
-      const head=create(doc,'label','pkai-hp-tools-label','Quick HP');
-      const slider=create(doc,'input','pkai-hp-range');
-      slider.type='range';slider.min='0';slider.step='1';slider.setAttribute('aria-label',slot.label+' current HP');
-      head.appendChild(slider);bar.appendChild(head);
-      const val=create(doc,'output','pkai-hp-value');bar.appendChild(val);
-      const one=create(doc,'button','pkai-hp-button','1 HP');one.type='button';bar.appendChild(one);
-      const full=create(doc,'button','pkai-hp-button','Full');full.type='button';bar.appendChild(full);
-      function max(){return adapter.fromSide(doc,slot.side,slot.index).maxHp;}
-      function commit(value){
-        if(writeNativeHP(native,value,max())){sync();onChange();}
-      }
-      slider.addEventListener('input',()=>commit(slider.value));
-      one.addEventListener('click',()=>commit(1));
-      full.addEventListener('click',()=>commit(max()));
-      // Existing calculator's number box remains editable; reflect its changes.
-      native.addEventListener('input',sync);
-      native.addEventListener('change',sync);
-      function sync(){
-        const hp=adapter.fromSide(doc,slot.side,slot.index);
-        const good=hp.maxHp!=null&&hp.hp!=null;
-        const maxValue=hp.maxHp||1;
-        slider.max=String(maxValue);slider.disabled=!good;
-        one.disabled=!good;full.disabled=!good;
-        if(good){
-          if(doc.activeElement!==slider)slider.value=String(hp.hp);
-          val.textContent=hp.hp+' / '+hp.maxHp;
-        }else{val.textContent='HP unavailable';}
-      }
-      // Put next to the native current-HP box, not in a separate AI panel.
-      bar.pkaiSync=sync;
-      container.appendChild(bar);
-      map.set(slot.id,{slot,bar,native,sync});
-      sync();
-    }
-    return {
-      sync(){for(const {sync}of map.values())sync?.();},
-      count:map.size
+  const norm=x=>String(x||'').toLowerCase().replace(/[^a-z0-9]/g,'');
+  const matches=(moves,names)=>moves.some(m=>names.includes(norm(m.name)));
+  const FLAG_NAMES={
+    basic:'Basic',evalAtt:'Evaluate Attack',expert:'Expert',doubles:'Tag Strategy (Doubles)',
+    setupFirstTurn:'Setup First Turn',risky:'Risky',prioDamage:'Prio Damage',
+    batonPass:'Baton Pass',checkHP:'Check HP',weather:'Weather',harassment:'Harassment'
+  };
+  const FLAGS=Object.keys(FLAG_NAMES);
+  const descriptors={
+    firstTurn:{label:'This is turn 1 of the battle',detail:'Setup First Turn, Weather, and Baton Pass checks'},
+    firstTurnOut:{label:'AI Pokémon is on its first turn out',detail:'Fake Out and Pluck checks'},
+    trickRoom:{label:'Trick Room is active',detail:'Dragon Dance, Agility and Tailwind'},
+    partyHasReserve:{label:'AI trainer has a reserve Pokémon',detail:'Explosion and Baton Pass'},
+    noTargetReserves:{label:'Player has NO reserve Pokémon',detail:'Explosion and entry hazards'},
+    stealthRockActive:{label:'Stealth Rock is already on the player’s side',detail:'Stealth Rock scoring'},
+    reflectActive:{label:'Reflect is already on the AI side',detail:'Reflect scoring'},
+    lightScreenActive:{label:'Light Screen is already on the AI side',detail:'Light Screen scoring'},
+    tailwindActive:{label:'Tailwind is already active for the AI side',detail:'Tailwind scoring'},
+    substituteActive:{label:'AI Pokémon already has a Substitute',detail:'Substitute scoring'},
+    flashFireActivated:{label:'AI Pokémon’s Flash Fire is activated',detail:'Doubles Lava Plume synergy'},
+    allyMagnetRise:{label:'AI partner has Magnet Rise active',detail:'Doubles Earthquake friendly-fire check'},
+    allyAlive:{label:'AI partner is still active',detail:'Doubles move scoring'},
+    spikesLayers:{label:'Spikes layers on player’s side',options:['0','1','2','3'],detail:'Spikes scoring'},
+    toxicSpikesLayers:{label:'Toxic Spikes layers on player’s side',options:['0','1','2'],detail:'Toxic Spikes scoring'},
+    weather:{label:'Current weather',options:['None','Sun','Rain','Sandstorm','Hail'],detail:'Weather-move scoring'},
+    lastMoveCategory:{label:'Opponent’s previous move category',options:['None','Physical','Special','Status'],detail:'Reflect, Light Screen, Calm Mind'},
+    userSlower:{label:'AI Pokémon is slower than this opponent',detail:'Speed-dependent Expert scoring'},
+    safeguard:{label:'Opponent is protected by Safeguard',detail:'Status-move prevention'},
+    cursed:{label:'Opponent is already affected by Ghost Curse',detail:'Ghost-type Curse scoring'}
+  };
+  function descriptorsFor(state) {
+    const moves=(state.moves||[]).filter(m=>m?.name && norm(m.name)!=='nomove');
+    const has=names=>matches(moves,names);
+    const enabled=name=>state.flags==null || !!state.flags[name];
+    const list=[];
+    const push=(field,group='General',t=null)=>{
+      const value=t===null?state[field]:state.targets?.[t]?.[field];
+      // Calculator state takes precedence over user-provided history overrides.
+      if(value!==undefined && value!==null && value!=='')return;
+      const def=descriptors[field];if(!def)return;
+      list.push({id:t===null?'state.'+field:'target.'+t+'.'+field,field,group,targetIndex:t,...def});
     };
+    if(enabled('setupFirstTurn')||enabled('batonPass')||enabled('weather')){
+      if(has(['curse','dragondance','calmmind','swordsdance','nast yplot'.replace(' ',''),
+        'agility','rockpolish','reflect','lightscreen','hail','explosion','selfdestruct',
+        'bellydrum','growth','trickroom']))push('firstTurn','Turn history');
+    }
+    if(has(['pluck','fakeout']))push('firstTurnOut','Turn history');
+    if(has(['dragondance','agility','rockpolish','tailwind']) && enabled('basic'))push('trickRoom','Field conditions');
+    if(has(['explosion','selfdestruct']) || enabled('batonPass') && has(['curse','dragondance','calmmind']))
+      push('partyHasReserve','Party information');
+    if(has(['explosion','selfdestruct','stealthrock','spikes','toxicspikes']))push('noTargetReserves','Party information');
+    if(has(['stealthrock']))push('stealthRockActive','Field conditions');
+    if(has(['spikes']))push('spikesLayers','Field conditions');
+    if(has(['toxicspikes']))push('toxicSpikesLayers','Field conditions');
+    if(has(['reflect']))push('reflectActive','Field conditions');
+    if(has(['lightscreen']))push('lightScreenActive','Field conditions');
+    if(has(['tailwind']))push('tailwindActive','Field conditions');
+    if(has(['substitute']))push('substituteActive','Field conditions');
+    if(has(['hail','raindance','sunnyday','sandstorm']) && enabled('expert'))push('weather','Field conditions');
+    if(state.format==='Doubles'){
+      if(has(['earthquake']))push('allyMagnetRise','Doubles ally');
+      if(has(['lavaplume']))push('flashFireActivated','Doubles ally');
+      if(has(['earthquake','discharge','surf','lavaplume','rockslide','blizzard']))push('allyAlive','Doubles ally');
+    }
+    for(let t=0;t<(state.targets?.length||0);t++){
+      const group=state.targets.length>1?`Opponent ${t+1}`:'Opponent history';
+      if(enabled('expert') && has(['reflect','lightscreen','calmmind']))push('lastMoveCategory',group,t);
+      if(enabled('expert') && has(['dragondance','agility','rockpolish','tailwind','recover','roost','softboiled','slackoff','milkdrink','healorder','explosion','selfdestruct']))
+        push('userSlower',group,t);
+      if(has(['hypnosis','spore','sleeppowder','yawn','toxic','thunderwave','willowisp','glare','stunspore']))push('safeguard',group,t);
+      if(has(['curse']) && (state.types||[]).includes('Ghost'))push('cursed',group,t);
+    }
+    return list;
   }
-  return {slots,findNativeInput,clampHP,writeNativeHP,addHPControls};
+  function apply(state,overrides={}){
+    // Never mutate the parsed calculator snapshot; keep context inputs separate.
+    const copy={...state,targets:(state.targets||[]).map(t=>({...t}))};
+    for(const [path,value] of Object.entries(overrides)){
+      if(value===null||value===undefined||value==='')continue;
+      const match=path.match(/^target\.(\d+)\.([a-zA-Z]+)$/);
+      if(match){const i=Number(match[1]),field=match[2];
+        if(copy.targets[i] && copy.targets[i][field]==null)copy.targets[i][field]=value;
+      }else if(path.startsWith('state.')){
+        const field=path.slice('state.'.length);
+        if(copy[field]==null)copy[field]=value;
+      }
+    }
+    // The AI checks both conditions in different routines; they describe the
+    // same underlying opponent reserve state.
+    if(copy.noTargetReserves!=null)
+      for(const t of copy.targets)if(t.hasReserves==null)t.hasReserves=!copy.noTargetReserves;
+    return copy;
+  }
+  return {FLAG_NAMES,FLAGS,descriptorsFor,apply,norm};
 });
 
-/* AI odds integration with native calculator state.
- * HP quick-adjust controls write to the existing calculator Current HP inputs.
- * Other unavailable battle details still suppress odds.
+/* Read native calculator fields, then ask only for battle history not stored by
+ * a static damage calculator. All controls live IN the page; no floating AI %.
  */
-(function () {
+(function(){
   'use strict';
   const doc=document;
-  if(!doc.body||!globalThis.PKAI||!globalThis.PKAICalcAdapter||doc.getElementById('pkai-launcher'))return;
-  const adapter=globalThis.PKAICalcAdapter, engine=globalThis.PKAI, hpControls=globalThis.PKAIHPControls;
+  if(!doc.body||!globalThis.PKAI||!globalThis.PKAICalcAdapter||!globalThis.PKAIContext||doc.getElementById('pkai-context'))return;
+  const adapter=globalThis.PKAICalcAdapter,engine=globalThis.PKAI,context=globalThis.PKAIContext;
   const create=(tag,text,cls)=>{
     const n=doc.createElement(tag);if(cls)n.className=cls;
     if(text!=null)n.textContent=String(text);return n;
   };
-  const style=create('style');style.textContent=`
-    #pkai-launcher{position:fixed;bottom:15px;right:15px;z-index:2147483600;border:1px solid #75b6f3;
-      background:#164778;color:#fff;border-radius:22px;font:700 14px system-ui;padding:10px 16px;cursor:pointer}
-    #pkai-dialog{display:none;position:fixed;right:12px;top:12px;max-width:min(530px,calc(100vw - 24px));
-      max-height:calc(100vh - 24px);overflow:auto;z-index:2147483601;background:#162237;border:1px solid #668bb6;
-      box-shadow:0 16px 55px #0009;border-radius:12px;padding:16px;color:#edf4ff;font:13px/1.5 system-ui}
-    #pkai-dialog h2{font-size:18px;margin:0 0 10px}#pkai-dialog h3{font-size:14px;margin:17px 0 5px}
-    #pkai-dialog button{padding:5px 9px;background:#25578e;color:white;border:1px solid #779bc0;border-radius:6px;cursor:pointer}
-    #pkai-dialog table{border-collapse:collapse;width:100%}#pkai-dialog td,#pkai-dialog th{padding:5px;text-align:left;border-bottom:1px solid #34465f}
-    #pkai-dialog .bad{color:#ffd09b}#pkai-dialog .muted{color:#bdcae0}#pkai-dialog code{color:#b6e1ff}
-    .pkai-hp-tools{display:flex;align-items:center;flex-wrap:wrap;gap:7px;padding:5px 0 0;
-      font:12px/1.4 system-ui,sans-serif;clear:both}
-    .pkai-hp-tools-label{display:flex;align-items:center;gap:7px;font-weight:600!important}
-    .pkai-hp-range{width:120px!important;max-width:30vw;cursor:pointer;accent-color:#2786b4}
-    .pkai-hp-value{font-variant-numeric:tabular-nums;min-width:70px}
-    .pkai-hp-button{font:inherit!important;padding:3px 7px!important;border-radius:5px!important;
-      border:1px solid #7195b2!important;background:transparent!important;color:inherit!important;cursor:pointer}
-    .pkai-hp-button:disabled{opacity:0.45;cursor:default}
+  const css=create('style');css.textContent=`
     .pkai-inline-odds{color:#087e90!important;font-weight:700!important;white-space:nowrap!important;
-      font:inherit!important;margin:0 5px!important;display:inline-block!important;
-      float:none!important;width:auto!important;max-width:none!important;overflow:visible!important;
-      visibility:visible!important;opacity:1!important;vertical-align:baseline!important}
+      font:inherit!important;margin:0 5px!important;display:inline-block!important;float:none!important;
+      width:auto!important;max-width:none!important;overflow:visible!important;visibility:visible!important;opacity:1!important;vertical-align:baseline!important}
     .pkai-inline-odds[data-pkai-placement="fallback"]{font-size:11px!important}
-  `;doc.head.appendChild(style);
-  const launcher=create('button','AI %');launcher.id='pkai-launcher';launcher.type='button';doc.body.appendChild(launcher);
-  const dialog=create('div');dialog.id='pkai-dialog';dialog.setAttribute('role','dialog');dialog.setAttribute('aria-label','AI move odds, auto-read');doc.body.appendChild(dialog);
-  const header=create('div');header.style.display='flex';header.style.justifyContent='space-between';header.style.gap='12px';
-  header.appendChild(create('h2','Platinum Kaizo · AI odds'));
-  const close=create('button','Close');close.type='button';header.appendChild(close);dialog.appendChild(header);
-  const subtitle=create('p','Edit Current HP in either Pokémon panel, or use its Quick HP slider / 1 HP / Full buttons. AI odds read the same native HP values.','muted');dialog.appendChild(subtitle);
-  const refresh=create('button','Read calculator again');refresh.type='button';dialog.appendChild(refresh);
-  const report=create('div');dialog.appendChild(report);
+    #pkai-context{margin:12px 0;padding:12px 14px;border:1px solid #9ba9b9;border-radius:9px;
+      background:var(--pkai-bg,transparent);font:12px/1.45 system-ui,Arial,sans-serif;color:inherit;max-width:100%;box-sizing:border-box}
+    #pkai-context .pkai-header{display:flex;gap:8px;align-items:center;justify-content:space-between;font-weight:700;font-size:13px;margin-bottom:4px}
+    #pkai-context .pkai-help{opacity:.78;font-size:11px;margin:4px 0 9px}
+    #pkai-context .pkai-fields{display:flex;flex-wrap:wrap;gap:7px 14px;align-items:center}
+    #pkai-context fieldset{border:1px solid #b7c0cb;border-radius:6px;min-width:180px;max-width:100%;margin:5px 0;padding:6px 8px 8px}
+    #pkai-context legend{font-weight:650;padding:0 4px}
+    #pkai-context .pkai-line{display:flex;align-items:center;gap:6px;min-height:24px;flex-wrap:wrap}
+    #pkai-context .pkai-line label{cursor:pointer;display:flex;align-items:center;gap:6px}
+    #pkai-context input[type="checkbox"]{width:15px;height:15px;flex:none;accent-color:#14869c;cursor:pointer}
+    #pkai-context select{max-width:190px;font:inherit;border:1px solid #a1afc2;border-radius:4px;padding:2px;background:Canvas;color:CanvasText}
+    #pkai-context .pkai-unknown{font-size:10px;opacity:.72}
+    #pkai-context .pkai-reset{font:inherit;font-size:11px;border:0;background:transparent;color:inherit;opacity:.7;cursor:pointer;padding:2px}
+    #pkai-context .pkai-warning{font-size:11px;color:#956010;overflow-wrap:anywhere}
+    #pkai-context .pkai-flag-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:5px 10px}
+    #pkai-context details{margin-top:5px}
+    #pkai-context summary{cursor:pointer}
+    #pkai-context ul{margin:5px 0 0;padding-left:18px}
+    #pkai-context .pkai-approx{font-size:11px;margin-top:7px;opacity:.75}
+  `;doc.head.appendChild(css);
+  // Remove stale floating UI from an older script version if it is present.
+  doc.getElementById('pkai-launcher')?.remove();doc.getElementById('pkai-dialog')?.remove();
   const holders=['resultDamageR1','resultDamageR2','resultDamageR3','resultDamageR4'];
-  // Attach odds as a SIBLING, not as a child of the native damage value. The
-  // calculator regularly replaces span.textContent, which deletes descendants.
-  // Keeping the badge outside the native damage span also prevents clipping by
-  // fixed-width damage styles and prevents our text from affecting damage parsing.
+  const key=x=>engine.nameKey(x);
+  const overridesBySelection=new Map();
+  const manualFlagsBySelection=new Map();
+  let latest=null,refreshing=false,scheduleTimer=null,selectedKey='';
+  function selectedSet(root){
+    const el=doc.querySelector(root+' .set-selector')||doc.querySelector(root+' .species');
+    return String(el?.value||el?.selectedOptions?.[0]?.textContent||'');
+  }
+  function flagsKey(){
+    const t=doc.querySelector('.trainer-pok-list .selected');
+    const trainer=t?.dataset?.trainerId||doc.querySelector('#trainer')?.value||'';
+    return JSON.stringify([String(trainer),selectedSet('#p2')]);
+  }
+  function selectionKey(){
+    // Last-used moves belong to a particular matchup. Trainer AI flags do NOT;
+    // they remain set when the player switches its active Pokémon.
+    return JSON.stringify([flagsKey(),selectedSet('#p1'),selectedSet('#p2-2'),selectedSet('#p1-2')]);
+  }
   function findDamageAnchor(i){
-    const id=holders[i];
-    const native=doc.getElementById(id);
+    const native=doc.getElementById(holders[i]);
     if(native)return {anchor:native,mode:'damage'};
     const radio=doc.getElementById('resultMoveR'+(i+1));
     const row=radio?.parentElement||doc.querySelectorAll('.results-right > div')[i]||null;
     if(row){
       const damage=[...row.querySelectorAll('span,[data-damage],.damage,.result-damage')]
-        .find(el=>!el.classList?.contains('pkai-inline-odds') &&
+        .find(el=>!el.classList?.contains('pkai-inline-odds')&&
           (el.id?.toLowerCase().includes('damage')||el.classList?.contains('damage')||
-           /(?:%|damage)/i.test(el.textContent||'')));
+          /(?:%|damage)/i.test(el.textContent||'')));
       if(damage)return {anchor:damage,mode:'alternative damage'};
       const label=radio?row.querySelector('label[for="resultMoveR'+(i+1)+'"]'):row.querySelector('label');
       if(label)return {anchor:label,mode:'move label'};
     }
-    // Last resort: the editor row exists but the results panel isn't in DOM.
     const input=doc.querySelector('#p2 .move'+(i+1)+' select.move-selector');
     return input?{anchor:input,mode:'move editor'}:{anchor:null,mode:'not found'};
   }
-  function locateInline(){
-    const locations=[];
-    for(let i=0;i<4;i++)locations.push({move:i+1,mode:findDamageAnchor(i).mode});
-    return locations;
+  function locateInline(){return Array.from({length:4},(_,i)=>({move:i+1,mode:findDamageAnchor(i).mode}));}
+  function contextHost(){
+    const result=doc.querySelector('.results-right')||doc.querySelector('.move-result-subgroup')||doc.querySelector('.move-result-group');
+    return result?.parentElement||doc.querySelector('#p2')||doc.body;
   }
-  const key=x=>engine.nameKey(x);
-  function needs(state,issues){
-    const missing=[];
-    const add=(detail)=>{if(!missing.includes(detail))missing.push(detail);};
-    if(!state.flags)add('Trainer AI flags are not present in the calculator’s selected trainer data.');
-    if(!state.format)add('Battle format is not exposed by the calculator.');
-    if(state.hp==null||state.maxHp==null||state.targets[0]?.hp==null||state.targets[0]?.maxHp==null)add('Current and maximum HP for both Pokémon.');
-    if(!state.types?.length||state.targets.some(t=>!t.types?.length))add('Pokémon type selections.');
-    if(state.targets[0]?.status==null && state.moves.some(m=>
-      ['yawn','hypnosis','spore','sleeppowder','toxic','thunderwave','willowisp','curse'].includes(key(m.name))))
-      add('Opponent’s current status (needed for status-move scoring).');
-    if(state.moves.some(m=>['curse','dragondance','swordsdance','nastyplot','calmmind','bulkup','agility'].includes(key(m.name)))){
-      const needed=new Set();
-      for(const m of state.moves){const n=key(m.name);
-        if(['curse','dragondance','swordsdance','bulkup'].includes(n))needed.add('atk');
-        if(['curse','bulkup'].includes(n))needed.add('def');
-        if(['dragondance','agility'].includes(n))needed.add('spe');
-        if(['calmmind','nastyplot'].includes(n))needed.add('spa');
-        if(n==='calmmind')needed.add('spd');
-      }
-      for(const n of needed)if(state.stages[n]==null)add(`AI ${n.toUpperCase()} stat stage.`);
-    }
-    if(state.moves.some(m=>m.category!=='Status')&&state.item==null)
-      add('AI held item (some items alter AI-versus-calc damage).');
-    if(state.moves.some(m=>m.category!=='Status')&&state.targets[0]?.ability==null)
-      add('Opponent ability (needed for immunity and AI knowledge checks).');
-    if(['Life Orb','Metronome','Expert Belt'].includes(state.item))
-      add(`${state.item}: ordinary damage results cannot be used as the AI's internal max damage.`);
-    if(['Filter','Solid Rock'].includes(state.targets[0]?.ability)||['Tinted Lens','Reckless'].includes(state.ability))
-      add('Ability changes AI damage calculation compared with normal calculator.');
-    if(doc.querySelector('#p2 .move-crit:checked'))
-      add('Forced critical hit: the displayed damage does not represent the AI damage check.');
-    if(state.format==='Doubles' && (state.targets[1]?.hp==null||!state.allyTypes?.length))add('Both active opponents and the AI ally (four-Pokémon battle state).');
-    for(const m of state.moves){
-      if(!m.name||key(m.name)==='nomove'||key(m.name)==='loading')continue;
-      if(!m.category)add(`Category of ${m.name}.`);
-      if(!m.type)add(`Type of ${m.name}.`);
-      if(m.category!=='Status')for(let i=0;i<state.targets.length;i++){
-        if(m.damage?.[i]==null && !['closecombat','bravebird','focuspunch','headsmash','takedown','explosion','selfdestruct'].includes(key(m.name)))
-          add(`AI damage proxy for ${m.name} against target ${i+1}.`);
-        if(m.effectiveness?.[i]==null)add(`Type effectiveness for ${m.name} against target ${i+1}.`);
+  const panel=create('section',null);panel.id='pkai-context';panel.setAttribute('aria-label','AI scoring context');
+  contextHost().appendChild(panel);
+  function attachPanel(){
+    const host=contextHost();if(panel.parentNode!==host)host.appendChild(panel);
+  }
+  function inputValue(overrides,id){return Object.prototype.hasOwnProperty.call(overrides,id)?overrides[id]:null;}
+  function renderControl(spec,store){
+    const row=create('div',null,'pkai-line');row.title=spec.detail||'';
+    const id='pkai-field-'+spec.id.replace(/[^a-z0-9]+/gi,'-');
+    const value=inputValue(store,spec.id);
+    if(spec.options){
+      const label=create('label',spec.label);label.htmlFor=id;row.appendChild(label);
+      const select=create('select');select.id=id;select.setAttribute('aria-label',spec.label);
+      const none=create('option','Choose…');none.value='';select.appendChild(none);
+      for(const choice of spec.options){const opt=create('option',choice);opt.value=choice;select.appendChild(opt);}
+      select.value=value==null?'':String(value);
+      select.addEventListener('change',()=>{if(select.value==='')delete store[spec.id];
+        else store[spec.id]=/^\d+$/.test(select.value)?Number(select.value):select.value;refreshView();});
+      row.appendChild(select);
+    }else{
+      const input=create('input');input.type='checkbox';input.id=id;
+      // An undetermined box is truly unknown, not a false assumption.
+      input.indeterminate=value===null;input.checked=value===true;
+      input.addEventListener('change',()=>{store[spec.id]=input.checked;refreshView();});
+      const label=create('label');label.htmlFor=id;label.append(input,doc.createTextNode(spec.label));row.appendChild(label);
+      if(value===null)row.appendChild(create('small','unknown','pkai-unknown'));
+      else{
+        const reset=create('button','↺','pkai-reset');reset.type='button';reset.title='Reset to unknown';
+        reset.setAttribute('aria-label','Reset '+spec.label+' to unknown');
+        reset.addEventListener('click',()=>{delete store[spec.id];refreshView();});row.appendChild(reset);
       }
     }
-    const knownFlags=state.flags||{};
-    if(knownFlags.expert){
-      if(state.moves.some(m=>['dragondance','agility','rockpolish','tailwind','recover','roost','softboiled','slackoff','milkdrink','healorder'].includes(key(m.name))) &&
-         state.targets.some(t=>t.userSlower==null))add('Actual attack order/speed against the opponent (including battle modifiers).');
-      if(state.moves.some(m=>['reflect','lightscreen','calmmind'].includes(key(m.name))) &&
-         state.targets.some(t=>t.lastMoveCategory==null))add('Opponent last-used move category (not kept in ordinary damage calc state).');
-    }
-    if((knownFlags.setupFirstTurn||knownFlags.weather||knownFlags.batonPass)&&state.firstTurn==null)
-      add('Current battle turn for First Turn, Weather or Baton Pass scoring.');
-    if(knownFlags.basic){
-      if(state.moves.some(m=>['stealthrock','spikes','toxicspikes'].includes(key(m.name))) &&state.stealthRockActive==null)
-        add('Stealth Rock / hazard state on the player’s side.');
-      if(state.moves.some(m=>['stealthrock','spikes','toxicspikes'].includes(key(m.name))) &&state.noTargetReserves==null)
-        add('Whether the opponent has reserve Pokémon (needed for hazard scoring).');
-      if(state.moves.some(m=>['tailwind','reflect','lightscreen'].includes(key(m.name))) &&
-        state.moves.some(m=>key(m.name)==='tailwind' ? state.tailwindActive==null:
-          key(m.name)==='reflect' ? state.reflectActive==null:state.lightScreenActive==null))
-        add('Screen or Tailwind state on the AI’s side.');
-      if(state.moves.some(m=>['dragondance','agility','rockpolish','tailwind'].includes(key(m.name)))&&state.trickRoom==null)
-        add('Whether Trick Room is active.');
-    }
-    if(knownFlags.expert&&state.moves.some(m=>key(m.name)==='pluck')&&state.firstTurnOut==null)
-      add('Whether the AI Pokémon is on its first turn on the field (Pluck Expert).');
-    if(knownFlags.doubles&&state.format==='Doubles'){
-      if(state.allyAbility==null)add('Ally ability for Tag Strategy.');
-      if(state.allyAlive==null)add('Whether the AI ally is alive.');
-    }
-    if(knownFlags.expert&&state.moves.some(m=>['hail','raindance','sunnyday','sandstorm'].includes(key(m.name)))&&!state.weather)
-      add('Current weather.');
-    // Missing information about AI memory and move locks cannot be inferred from a
-    // static damage calculator. It does not become "false" by being absent.
-    return missing;
+    return row;
   }
-  const fmt=x=>x==null?'not exposed':typeof x==='object'?JSON.stringify(x):String(x);
-  function title(text){return create('h3',text);}
-  function paintReport(snapshot,missing,result){
-    const {state,issues,source}=snapshot;
-    report.replaceChildren();
-    const status=create('p',missing.length?'Incomplete battle state; odds withheld.':
-      'Modeled move-selection odds shown (approximate; not cartridge-verified).',missing.length?'bad':'muted');
-    report.appendChild(status);
-    if(missing.length){report.appendChild(title('Missing from the calculator'));
-      const ul=create('ul');missing.forEach(s=>ul.appendChild(create('li',s)));report.appendChild(ul);
+  function renderFlags(existingFlags){
+    if(existingFlags)return null;
+    const fieldset=create('fieldset');fieldset.appendChild(create('legend','Trainer AI flags (not provided by calc)'));
+    fieldset.appendChild(create('p','Select every enabled flag. Unchecked flags count as disabled after you make a selection. No defaults are assumed.','pkai-help'));
+    const list=create('div',null,'pkai-flag-list');
+    const chosen=manualFlagsBySelection.get(flagsKey());
+    for(const [flag,label] of Object.entries(context.FLAG_NAMES)){
+      const row=create('div',null,'pkai-line');const input=create('input');input.type='checkbox';
+      input.checked=!!chosen?.[flag];input.id='pkai-flag-'+flag;
+      const caption=create('label');caption.htmlFor=input.id;caption.append(input,doc.createTextNode(label));row.appendChild(caption);
+      input.addEventListener('change',()=>{
+        const next={...(manualFlagsBySelection.get(flagsKey())||Object.fromEntries(context.FLAGS.map(k=>[k,false])))};
+        next[flag]=input.checked;manualFlagsBySelection.set(flagsKey(),next);refreshView();
+      });list.appendChild(row);
     }
-    report.appendChild(title('Read automatically'));
-    const table=create('table');
-    for(const [k,v]of [
-      ['Battle format',state.format],['Trainer AI flags',source||'not exposed'],
-      ['AI HP',`${fmt(state.hp)} / ${fmt(state.maxHp)}`],['AI typing',state.types?.join('/')||'not exposed'],
-      ['AI ability',state.ability],['AI status',state.aiStatus],['AI stages',state.stages],
-      ['Opponent HP',`${fmt(state.targets[0]?.hp)} / ${fmt(state.targets[0]?.maxHp)}`],
-      ['Opponent typing',state.targets[0]?.types?.join('/')],['Trick Room',state.trickRoom],
-      ['Weather',state.weather],['Battle turn 1',state.firstTurn]
-    ]){const tr=create('tr');tr.appendChild(create('td',k));tr.appendChild(create('td',fmt(v)));table.appendChild(tr);}report.appendChild(table);
-    report.appendChild(title('Move scoring'));
-    const movesTable=create('table');
-    for(let i=0;i<state.moves.length;i++){
-      const m=state.moves[i];const tr=create('tr');tr.appendChild(create('td',m.name||'(empty)'));
-      tr.appendChild(create('td',m.category||'?'));
-      tr.appendChild(create('td',m.damage?.[0]==null?'no reliable HP damage':String(m.damage[0])+' HP'));
-      tr.appendChild(create('td',result?`${(result.choice[i].total*100).toFixed(2)}%`:'—'));
-      movesTable.appendChild(tr);
-    }report.appendChild(movesTable);
-    if(result){
-      report.appendChild(create('p','~ indicates a modeled estimate. This is not a claim of exact Platinum Kaizo AI behavior.','muted'));
-      if(result.omissions.length){report.appendChild(title('Unimplemented rule branches'));
-        const ul=create('ul');result.omissions.slice(0,20).forEach(s=>ul.appendChild(create('li',s)));report.appendChild(ul);
+    fieldset.appendChild(list);
+    if(chosen){
+      const reset=create('button','Clear manual flags','pkai-reset');reset.type='button';
+      reset.addEventListener('click',()=>{manualFlagsBySelection.delete(flagsKey());refreshView();});fieldset.appendChild(reset);
+    }
+    return fieldset;
+  }
+  function renderPanel(snapshot,applicable,missing,blockers,result,notes){
+    panel.replaceChildren();
+    const header=create('div',null,'pkai-header');header.appendChild(create('span','AI scoring context'));
+    header.appendChild(create('span',snapshot.state.flags?'Flags: read from trainer':'Flags: not exposed'));
+    panel.appendChild(header);
+    panel.appendChild(create('div','Move odds appear beside the enemy move damage ranges. Fill in only battle history that the damage calculator does not track.','pkai-help'));
+    const flags=renderFlags(snapshot.state.flags);if(flags)panel.appendChild(flags);
+    if(applicable.length){
+      const groups=new Map();for(const spec of applicable){
+        if(!groups.has(spec.group))groups.set(spec.group,[]);
+        groups.get(spec.group).push(spec);
+      }
+      let store=overridesBySelection.get(selectedKey);
+      if(!store){store={};overridesBySelection.set(selectedKey,store);}
+      for(const [group,specs] of groups){
+        const fs=create('fieldset');fs.appendChild(create('legend',group));
+        const rows=create('div',null,'pkai-fields');for(const spec of specs)rows.appendChild(renderControl(spec,store));
+        fs.appendChild(rows);panel.appendChild(fs);
       }
     }
-    const notable=issues.filter(issue=>!missing.some(m=>m.includes(issue.field))).slice(0,12);
-    if(notable.length){report.appendChild(title('Other diagnostics'));const ul=create('ul');notable.forEach(x=>ul.appendChild(create('li',x.field+': '+x.detail)));report.appendChild(ul);}
+    if(!applicable.length && snapshot.state.flags)panel.appendChild(create('div','No additional history inputs needed for the recognized scoring rules.','pkai-help'));
+    if(blockers.length)panel.appendChild(create('div','AI odds unavailable: '+blockers[0],'pkai-warning'));
+    if(notes.length)panel.appendChild(create('div','Estimated odds: '+notes[0],'pkai-warning'));
+    if((missing.length||result?.omissions?.length||snapshot.issues?.length||blockers.length)){
+      const details=create('details');const summary=create('summary','Scoring diagnostics');details.appendChild(summary);
+      const ul=create('ul');
+      const all=[...blockers,...missing,...(result?.omissions||[]),...(snapshot.issues||[]).map(x=>x.field+': '+x.detail)];
+      for(const item of [...new Set(all)].slice(0,24))ul.appendChild(create('li',item));
+      details.appendChild(ul);panel.appendChild(details);
+    }
+    panel.appendChild(create('div','~ = estimated odds. Some Platinum Kaizo scoring rules and AI damage quirks are not yet implemented.','pkai-approx'));
   }
-  function paintInline(snapshot,missing,result){
+  function paintInline(snapshot,result,blockers,notes){
     for(let i=0;i<4;i++){
       const {anchor,mode}=findDamageAnchor(i);
       let span=doc.getElementById('pkai-odds-R'+(i+1));
-      // Remove badges inserted INSIDE the damage span by older versions.
       doc.querySelectorAll('#'+holders[i]+' > .pkai-inline-odds').forEach(x=>x.remove());
-      if(!anchor){if(span)span.remove();continue;}
+      if(!anchor){span?.remove();continue;}
       if(!span){span=create('span','','pkai-inline-odds');span.id='pkai-odds-R'+(i+1);}
-      // Keep label directly after the native damage element. Reattach if the
-      // calculator replaced its entire result row.
       if(anchor.nextElementSibling!==span)anchor.insertAdjacentElement('afterend',span);
       span.dataset.pkaiPlacement=mode==='damage'?'damage':'fallback';
       const move=snapshot?.state?.moves?.[i];
-      if(move && ['nomove','loading'].includes(key(move.name))){span.textContent='';continue;}
+      if(!move || ['nomove','loading'].includes(key(move.name))){span.textContent='';continue;}
       const score=result?.choice?.[i]?.total;
-      span.textContent=Number.isFinite(score)?` (AI: ~${(score*100).toFixed(1)}%)`:' (AI: —)';
-      const reason=missing?.[0]||'required battle state or scoring rules are unavailable';
-      span.title=Number.isFinite(score)?'Modeled move-selection probability (approximate, not cartridge-verified)'
-        :`AI probability unavailable: ${reason}. Click AI % for details.`;
+      span.textContent=Number.isFinite(score)?` (AI est: ~${(score*100).toFixed(1)}%)`:' (AI: —)';
+      span.title=Number.isFinite(score)?'Conditional estimated move-selection chance. '+notes.join(' '):
+        'Cannot calculate: '+(blockers[0]||'missing battle data')+'. See AI scoring context below the moves.';
     }
   }
-
-  let latest=null,refreshing=false;
-  let hpUI=null;
+  function hardBlockers(state){
+    const b=[],add=s=>{if(!b.includes(s))b.push(s);};
+    if(!state.flags)add('Trainer AI flags unavailable: select them below, or expose them in trainer data.');
+    if(!Number.isFinite(state.hp)||!Number.isFinite(state.maxHp)||state.maxHp<=0||
+      (state.targets||[]).some(t=>!Number.isFinite(t.hp)||!Number.isFinite(t.maxHp)||t.maxHp<=0))add('Current/max HP not readable from the calculator');
+    if(state.targets?.length===2 && ![1,2].includes(state.allyTypes?.length))add('Doubles ally types unavailable in calculator');
+    for(const move of state.moves||[]){
+      if(!move?.name||['nomove','loading'].includes(key(move.name)))continue;
+      if(!['Physical','Special','Status'].includes(move.category))add('Unknown move category: '+move.name);
+      if(move.category!=='Status')for(let t=0;t<state.targets.length;t++){
+        if(move.damage?.[t]==null && !['closecombat','bravebird','focuspunch','headsmash','takedown','explosion','selfdestruct'].includes(key(move.name)))
+          add('AI damage estimate missing for '+move.name+' against opponent '+(t+1));
+        if(move.effectiveness?.[t]==null)add('Type effectiveness missing for '+move.name);
+      }
+    }
+    return b;
+  }
   function refreshView(){
     if(refreshing)return;refreshing=true;
-    if(hpControls){
-      // The calculator can render Pokémon panels after the userscript starts.
-      hpUI=hpControls.addHPControls(doc,adapter,queue);
-      hpUI.sync();
-    }
     try{
-      const snapshot=adapter.readBattle(doc,globalThis),s=snapshot.state;
-      const missing=needs(s,snapshot.issues);
+      attachPanel();
+      selectedKey=selectionKey();
+      const snapshot=adapter.readBattle(doc,globalThis);
+      const store=overridesBySelection.get(selectedKey)||{};
+      const original=snapshot.state;
+      // Controls are keyed to the current matchup, not carried across foes.
+      let state=context.apply(original,store);
+      const chosen=manualFlagsBySelection.get(flagsKey());
+      const notes=[];
+      if(!state.flags && chosen){state={...state,flags:chosen};notes.push('Trainer flags manually selected; not verified from source data.');}
+      if(!state.format){state={...state,format:'Singles'};notes.push('Battle format not exposed; treating it as Singles.');}
+      const applicable=context.descriptorsFor(state);
+      const unresolved=applicable.filter(x=>inputValue(store,x.id)==null);
+      if(unresolved.length)notes.push(unresolved.length+' history/field conditions remain unknown.');
+      const blockers=hardBlockers(state);
       let result=null;
-      if(!missing.length){
-        try{result=engine.calculate(s);}catch(e){missing.push(e.message||String(e));}
-      }
-      latest={snapshot,missing,result};paintInline(snapshot,missing,result);paintReport(snapshot,missing,result);
-      report.appendChild(title('Inline display locations'));
-      const locations=create('p',locateInline().map(x=>'Move '+x.move+': '+x.mode).join(' · '),'muted');report.appendChild(locations);
+      if(!blockers.length){try{result=engine.calculate(state);}catch(e){blockers.push(e.message||String(e));}}
+      const missing=unresolved.map(x=>x.label+' (not provided by calculator)');
+      latest={snapshot:{...snapshot,state},missing,blockers,result,notes,controls:applicable};
+      paintInline(latest.snapshot,result,blockers,notes);
+      renderPanel({...snapshot,state:original},applicable,missing,blockers,result,notes);
     }catch(e){
-      const text=`AI data reader error: ${e?.message||e}`;
-      latest={error:text};report.replaceChildren(create('p',text,'bad'));
-      paintInline(null,[text],null);
+      const error='AI reader error: '+(e?.message||e);
+      latest={error};
+      paintInline(null,null,[error],[]);
+      panel.replaceChildren(create('strong',error,'pkai-warning'));
     }finally{refreshing=false;}
   }
-  const toggle=()=>{dialog.style.display=dialog.style.display==='block'?'none':'block';if(dialog.style.display==='block')refreshView();};
-  launcher.addEventListener('click',toggle);close.addEventListener('click',()=>{dialog.style.display='none';});
-  refresh.addEventListener('click',refreshView);
-  let pending=null;
-  const queue=()=>{if(pending!=null)return;pending=setTimeout(()=>{pending=null;refreshView();},130);};
-  const isOwn=target=>target?.closest?.('#pkai-dialog,#pkai-launcher,.pkai-inline-odds,.pkai-hp-tools');
+  const isOwn=node=>node?.closest?.('#pkai-context,.pkai-inline-odds');
+  function queue(){if(scheduleTimer!==null)return;scheduleTimer=setTimeout(()=>{scheduleTimer=null;refreshView();},140);}
   const observer=new MutationObserver(changes=>{
     for(const m of changes){
       const node=m.target.nodeType===3?m.target.parentElement:m.target;
       if(isOwn(node))continue;
-      const resultContainerChanged=[...m.addedNodes,...m.removedNodes].some(n=>n.nodeType===1 &&
-        (n.matches?.('.move-result-group,.results-right,[id^="resultDamageR"]') ||
-         n.querySelector?.('[id^="resultDamageR"],.results-right')));
-      if(resultContainerChanged || node?.closest?.('#p1,#p2,#p1-2,#p2-2,.move-result-group,.field-info,#field, #ai-container')){
-        const changed=[...m.addedNodes,...m.removedNodes];
-        if(changed.length&&changed.every(x=>x.nodeType===1&&x.classList?.contains('pkai-inline-odds')))continue;
-        queue();return;
-      }
+      const changed=[...m.addedNodes,...m.removedNodes];
+      if(changed.length&&changed.every(n=>n.nodeType===1 &&
+        (n.matches?.('.pkai-inline-odds,#pkai-context')||n.closest?.('#pkai-context'))))continue;
+      const changedResult=changed.some(n=>n.nodeType===1&&
+        (n.matches?.('[id^="resultDamageR"],.results-right,.move-result-group')||n.querySelector?.('[id^="resultDamageR"]')));
+      if(changedResult||node?.closest?.('#p1,#p2,#p1-2,#p2-2,.move-result-group,.field-info,#field,#ai-container')){queue();break;}
     }
   });
-  observer.observe(doc.body,{subtree:true,childList:true,characterData:true,attributes:false});
+  observer.observe(doc.body,{subtree:true,childList:true,characterData:true});
   doc.addEventListener('input',e=>{if(!isOwn(e.target))queue();},true);
   doc.addEventListener('change',e=>{if(!isOwn(e.target))queue();},true);
-  globalThis.PKAIInline={version:'0.7.0',refresh:refreshView,snapshot:()=>latest?.snapshot?.state,
-    locations:locateInline,diagnostics:()=>latest?.missing||[latest?.error],
-    hide:()=>{dialog.style.display='none';}};
+  globalThis.PKAIInline={version:'1.0.0',refresh:refreshView,snapshot:()=>latest?.snapshot?.state,
+    locations:locateInline,diagnostics:()=>latest?.error?[latest.error]:[...(latest?.blockers||[]),...(latest?.missing||[]),...(latest?.notes||[])],
+    controls:()=>latest?.controls||[]};
   refreshView();
 })();
 
