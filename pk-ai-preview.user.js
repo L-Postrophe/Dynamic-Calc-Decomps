@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Platinum Kaizo AI Odds — Inline Damage Results
 // @namespace    https://github.com/hzla/Dynamic-Calc-Decomps
-// @version      1.3.0
+// @version      1.4.0
 // @description  Inline AI preview with contextual inputs; hides legacy Quick HP controls.
 // @match        https://hzla.github.io/Dynamic-Calc-Decomps/*
 // @match        https://l-postrophe.github.io/Dynamic-Calc-Decomps/*
@@ -921,30 +921,58 @@
       reason:`Estimated ONE hit from ${total} total damage ÷ ${divisor} (${hitInfo.min}–${hitInfo.max} hits; rounded display)`,
       range:ordinary.range};
   }
+  // Compute *effective* Speed from the two visible stat tables, rather than
+  // comparing unmodified `.totalMod` labels.  In particular, paralysis,
+  // stat stages, held items, field Tailwind and weather abilities can reverse
+  // the ordering.  Unknown effects must remain unknown, not a guessed 'No'.
+  function effectiveSpeed(doc,side){
+    const base=readSpeed(doc,side);
+    const stage=readBoosts(doc,side).spe;
+    const rawStatus=readStatus(doc,side);
+    const ability=flatKey(readAbility(doc,side));
+    let item=flatKey(readItem(doc,side));
+    const root=sideId(side);
+    const toggle=doc.querySelector(`#${root} .itemToggle`);
+    if(toggle && !toggle.checked)item='';
+    const weather=readWeather(doc);
+    const tailwind=readBoolean(doc,[`#tailwind${side.charAt(0)}`]);
+    if(base==null || !Number.isFinite(base) || stage==null || rawStatus==null || tailwind==null)
+      return {value:null,reason:'Base Speed, stat boosts, status, or Tailwind missing'};
+    if(!Number.isInteger(stage)||Math.abs(stage)>6)
+      return {value:null,reason:'Speed stat stage invalid'};
+    // These abilities have time-dependent activation not captured by the
+    // normal stat sheet; requesting history is safer than inventing an order.
+    if(['unburden','slowstart'].includes(ability))
+      return {value:null,reason:ability+' activation needs battle history'};
+    if(['swiftswim','chlorophyll'].includes(ability) && weather==null)
+      return {value:null,reason:'Weather not exposed for Speed ability'};
+    if(item==='quickpowder' || item==='metalpowder')
+      return {value:null,reason:'Species-dependent item effect needs verification'};
+    const boosted = Math.floor(base * (stage>=0?(2+stage)/2:2/(2-stage)));
+    let result=boosted;
+    const status=flatKey(rawStatus);
+    const hasStatus=!['','healthy','none','nostatus','confused'].includes(status);
+    if(status==='paralyzed' && ability!=='quickfeet')result=Math.floor(result/4);
+    if(ability==='quickfeet' && hasStatus)result=Math.floor(result*1.5);
+    if(ability==='swiftswim' && weather==='Rain')result*=2;
+    if(ability==='chlorophyll' && weather==='Sun')result*=2;
+    if(item==='choicescarf')result=Math.floor(result*1.5);
+    if(['ironball','machobrace','powerweight','powerbracer','powerbelt',
+        'powerlens','powerband','poweranklet'].includes(item))result=Math.floor(result/2);
+    if(tailwind)result*=2;
+    // Lagging Tail / Full Incense affect action order instead of Speed.  The
+    // Expert script may test turn order, so don't misrepresent those as a
+    // standard stat-only comparison.
+    if(['laggingtail','fullincense'].includes(item))
+      return {value:null,reason:'Item changes move order independently of Speed'};
+    return {value:Math.max(1,result),reason:'Speed stat, stages, status, held item, ability, weather and Tailwind'};
+  }
   function readAttackOrder(doc,side='R',target='L'){
-    const a=readSpeed(doc,side),b=readSpeed(doc,target);
-    // The .totalMod field in Showdown calcs is the post-modifier stat. If not
-    // present, we have no reliable basis for speed order with boosts/status/weather.
-    const aMod=numeric(doc,[`#${sideId(side)} .sp .totalMod`,`#${sideId(side)} .spe .totalMod`]);
-    const bMod=numeric(doc,[`#${sideId(target)} .sp .totalMod`,`#${sideId(target)} .spe .totalMod`]);
-    if(aMod!=null&&bMod!=null&&aMod!==bMod)return {userSlower:aMod<bMod,source:'modified speed totals'};
-    if(a!=null&&b!=null){
-      const stagesA=readBoosts(doc,side),stagesB=readBoosts(doc,target);
-      const sa=readStatus(doc,side),sb=readStatus(doc,target);
-      const abilities=[readAbility(doc,side),readAbility(doc,target)];
-      const items=[readItem(doc,side),readItem(doc,target)];
-      const weather=readWeather(doc);
-      if(abilities.some(x=>['Swift Swim','Chlorophyll','Quick Feet','Slow Start','Unburden'].includes(x))||
-        items.includes('Choice Scarf') || weather && weather!=='None')return {userSlower:null,source:null};
-      if(!sa||!sb)return {userSlower:null,source:null};
-      const calc=(speed,stage,status)=>{
-        const s=Number(stage.spe||0), factor=s>=0?(2+s)/2:2/(2-s);
-        return Math.floor(speed*factor)*(status==='Paralyzed'?0.25:1);
-      };
-      const x=calc(a,stagesA,sa),y=calc(b,stagesB,sb);
-      return {userSlower:x===y?null:x<y,source:x===y?null:'calc speed and visible modifiers'};
-    }
-    return {userSlower:null,source:null};
+    const ai=effectiveSpeed(doc,side),foe=effectiveSpeed(doc,target);
+    if(ai.value==null||foe.value==null)
+      return {userSlower:null,source:null,reason:[ai.reason,foe.reason].filter(Boolean).join('; ')};
+    return {userSlower:ai.value<foe.value,source:'effective Speed from calculator',
+      aiSpeed:ai.value,foeSpeed:foe.value,reason:ai.value===foe.value?'Speed tie':null};
   }
   function readBattle(doc,globals={}){
     const issues=[];const note=(field,detail)=>{issues.push({field,detail});};
@@ -1026,7 +1054,7 @@
     return {state,issues,source:trainer.source};
   }
 
-  return {TYPES,fromSide,readTypes,readAbility,readStatus,readItem,readBoosts,readSpeed,readFormat,readWeather,readTrickRoom,moveMetadata,typeEffectiveness,parseDamage,parseDamageDetail,numeric:number,decodeFlags,parseVisibleFlagLabels,readVisibleFlagBadges,readTrainerFlags,rawDamageFromText,readBoolean,readFieldState,readHistory,readAttackOrder,readNativeDamage,readAIDamage,readHitInfo,readBattle};
+  return {TYPES,fromSide,readTypes,readAbility,readStatus,readItem,readBoosts,readSpeed,readFormat,readWeather,readTrickRoom,moveMetadata,typeEffectiveness,parseDamage,parseDamageDetail,numeric:number,decodeFlags,parseVisibleFlagLabels,readVisibleFlagBadges,readTrainerFlags,rawDamageFromText,readBoolean,readFieldState,readHistory,readAttackOrder,effectiveSpeed,readNativeDamage,readAIDamage,readHitInfo,readBattle};
 });
 
 /* Optional battle context that a static damage calculator cannot always know.
@@ -1143,7 +1171,7 @@
   'use strict';
   const doc=document;
   if(!doc.body||!globalThis.PKAI||!globalThis.PKAICalcAdapter||!globalThis.PKAIContext)return;
-  if(doc.getElementById('pkai-context')?.dataset?.pkaiVersion==='1.3.0')return;
+  if(doc.getElementById('pkai-context')?.dataset?.pkaiVersion==='1.4.0')return;
   // Replace a stale panel from the previous release, if both scripts were loaded.
   doc.getElementById('pkai-context')?.remove();
   const adapter=globalThis.PKAICalcAdapter,engine=globalThis.PKAI,context=globalThis.PKAIContext;
@@ -1168,10 +1196,13 @@
     #pkai-context legend{font-weight:650;padding:0 4px}
     #pkai-context .pkai-line{display:flex;align-items:center;gap:6px;min-height:24px;flex-wrap:wrap}
     #pkai-context .pkai-line label{cursor:pointer;display:flex;align-items:center;gap:6px}
-    #pkai-context input[type="checkbox"]{width:15px;height:15px;flex:none;accent-color:#14869c;cursor:pointer}
+    #pkai-context input[type="checkbox"]{appearance:auto!important;display:inline-block!important;
+      position:static!important;opacity:1!important;visibility:visible!important;
+      width:16px!important;height:16px!important;flex:none;accent-color:#14869c;cursor:pointer}
     #pkai-context select{max-width:190px;font:inherit;border:1px solid #a1afc2;border-radius:4px;padding:2px;background:Canvas;color:CanvasText}
     #pkai-context .pkai-unknown{font-size:10px;opacity:.72}
     #pkai-context .pkai-reset{font:inherit;font-size:11px;border:0;background:transparent;color:inherit;opacity:.7;cursor:pointer;padding:2px}
+    #pkai-context .pkai-reset:disabled{opacity:.25;cursor:default}
     #pkai-context .pkai-warning{font-size:11px;color:#956010;overflow-wrap:anywhere}
     #pkai-context .pkai-flag-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:5px 10px}
     #pkai-context details{margin-top:5px}
@@ -1235,7 +1266,7 @@
     const result=doc.querySelector('.results-right')||doc.querySelector('.move-result-subgroup')||doc.querySelector('.move-result-group');
     return result?.parentElement||doc.querySelector('#p2')||doc.body;
   }
-  const panel=create('section',null);panel.id='pkai-context';panel.dataset.pkaiVersion='1.3.0';panel.setAttribute('aria-label','AI scoring context');
+  const panel=create('section',null);panel.id='pkai-context';panel.dataset.pkaiVersion='1.4.0';panel.setAttribute('aria-label','AI scoring context');
   contextHost().appendChild(panel);
   function attachPanel(){
     const host=contextHost();if(panel.parentNode!==host)host.appendChild(panel);
@@ -1256,16 +1287,19 @@
       row.appendChild(select);
     }else{
       const input=create('input');input.type='checkbox';input.id=id;
-      // An undetermined box is truly unknown, not a false assumption.
-      input.indeterminate=value===null;input.checked=value===true;
+      // Do not display an indeterminate (minus) checkbox: it looked like a
+      // collapse control, and the prior implementation removed it on click.
+      // Unknown is visually marked, while the checkbox stays present after
+      // both Yes and No answers.  Click once for Yes, again for No; reset ?.
+      input.checked=value===true;
       input.addEventListener('change',()=>{store[spec.id]=input.checked;refreshView();});
       const label=create('label');label.htmlFor=id;label.append(input,doc.createTextNode(spec.label));row.appendChild(label);
-      if(value===null)row.appendChild(create('small','unknown','pkai-unknown'));
-      else{
-        const reset=create('button','↺','pkai-reset');reset.type='button';reset.title='Reset to unknown';
-        reset.setAttribute('aria-label','Reset '+spec.label+' to unknown');
-        reset.addEventListener('click',()=>{delete store[spec.id];refreshView();});row.appendChild(reset);
-      }
+      if(value===null)row.appendChild(create('small','Not set — click to choose Yes','pkai-unknown'));
+      else row.appendChild(create('small',value===true?'Yes':'No','pkai-unknown'));
+      const reset=create('button','↺','pkai-reset');reset.type='button';reset.title='Reset to unknown';
+      reset.setAttribute('aria-label','Reset '+spec.label+' to unknown');
+      reset.disabled=value===null;
+      reset.addEventListener('click',()=>{delete store[spec.id];refreshView();});row.appendChild(reset);
     }
     return row;
   }
@@ -1308,7 +1342,14 @@
     const header=create('div',null,'pkai-header');header.appendChild(create('span','AI scoring context'));
     header.appendChild(create('span',snapshot.flagsSource==='native'?'Flags: read from trainer':'Flags: assumed for preview'));
     panel.appendChild(header);
-    panel.appendChild(create('div','Move odds appear beside the enemy move damage ranges. Fill in only battle history that the damage calculator does not track.','pkai-help'));
+    panel.appendChild(create('div','Move odds appear beside enemy damage ranges. Checkboxes appear only for conditions the calculator cannot infer. Checked = Yes; unchecked = No; ↺ = reset to Unknown.','pkai-help'));
+    const speed=adapter.readAttackOrder(doc,'R','L');
+    if(Number.isFinite(speed.aiSpeed)&&Number.isFinite(speed.foeSpeed)){
+      panel.appendChild(create('div',
+        `Speed read automatically: AI ${speed.aiSpeed} / opponent ${speed.foeSpeed} — `+
+        (speed.aiSpeed<speed.foeSpeed?'AI slower':speed.aiSpeed>speed.foeSpeed?'AI faster':'Speed tie')+
+        '. Trick Room reverses move order but not these Speed values.','pkai-help'));
+    }
     const flags=renderFlags(snapshot.flagsSource==='native'?snapshot.state.flags:null,snapshot.state.format);if(flags)panel.appendChild(flags);
     if(applicable.length){
       const groups=new Map();for(const spec of applicable){
@@ -1417,7 +1458,11 @@
         state={...state,flags:manualFlagsBySelection.get(flagsKey())||assumedFlags(state.format)};
         notes.push('CONDITIONAL PREVIEW: trainer AI flag mask was not found. The current checkboxes are assumptions, not detected trainer data.');
       }
-      const applicable=context.descriptorsFor(state);
+      // IMPORTANT: derive which controls exist from the unmodified calculator
+      // snapshot, not from the user's overrides.  Otherwise the instant a user
+      // checks an Unknown box, it ceases to be "missing" and disappears.
+      // Retain the chosen flag mask so only relevant controls are displayed.
+      const applicable=context.descriptorsFor({...original,flags:state.flags,format:state.format});
       const unresolved=applicable.filter(x=>inputValue(store,x.id)==null);
       if(unresolved.length)notes.push(unresolved.length+' history/field conditions remain unknown.');
       const prepared=prepareScoringState(state);
@@ -1459,7 +1504,7 @@
   observer.observe(doc.body,{subtree:true,childList:true,characterData:true});
   doc.addEventListener('input',e=>{if(!isOwn(e.target))queue();},true);
   doc.addEventListener('change',e=>{if(!isOwn(e.target))queue();},true);
-  globalThis.PKAIInline={version:'1.3.0',refresh:refreshView,snapshot:()=>latest?.snapshot?.state,
+  globalThis.PKAIInline={version:'1.4.0',refresh:refreshView,snapshot:()=>latest?.snapshot?.state,
     locations:locateInline,diagnostics:()=>latest?.error?[latest.error]:[...(latest?.blockers||[]),...(latest?.missing||[]),...(latest?.notes||[])],
     controls:()=>latest?.controls||[],
     flagSource:()=>latest?.snapshot?.flagsSource,
