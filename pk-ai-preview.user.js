@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Platinum Kaizo AI Odds — Inline Damage Results
 // @namespace    https://github.com/hzla/Dynamic-Calc-Decomps
-// @version      1.2.0
+// @version      1.3.0
 // @description  Inline AI preview with contextual inputs; hides legacy Quick HP controls.
 // @match        https://hzla.github.io/Dynamic-Calc-Decomps/*
 // @match        https://l-postrophe.github.io/Dynamic-Calc-Decomps/*
@@ -13,6 +13,7 @@
 /* Platinum Kaizo AI score distribution prototype.
  * The distribution math and per-target selection rules are exact for the modeled rules.
  * Unmodeled move-specific rules and calculator-vs-AI damage differences are reported.
+ * For missing damage, the panel marks conditional estimates (not game odds).
  * Source: https://bparkpk.github.io/PKMoveScoring/ (individual move pages).
  */
 (function (root, factory) {
@@ -534,10 +535,12 @@
     const bp=number(row?.querySelector('input.move-bp')?.value);
     const k=key(name), raw=(globals.moves||globals.MOVES||globals.moveData||{})[name]||(globals.moves||globals.MOVES||globals.moveData||{})[k];
     const dataCategory=['Physical','Special','Status'].includes(raw?.category)?raw.category:null;
-    const category=dataCategory||(STATUS.has(k)?'Status':SPECIAL.has(k)?'Special':PHYSICAL.has(k)?'Physical':null);
+    const category=dataCategory||(STATUS.has(k)?'Status':SPECIAL.has(k)?'Special':PHYSICAL.has(k)?'Physical':
+      bp>0?'Physical':null);
+    const categoryInferred= !dataCategory && !STATUS.has(k) && !SPECIAL.has(k) && !PHYSICAL.has(k) && bp>0;
     const pri=Number.isInteger(raw?.priority)?raw.priority:PRIORITY[k]??0;
     const specialStatus=category==='Status';
-    return {name,category,type:moveType||typeName(raw?.type),basePower:bp,priority:pri,hitInfo:readHitInfo(name,raw),source:dataCategory?'native':category?'reference':'unknown',isStatus:specialStatus};
+    return {name,category,type:moveType||typeName(raw?.type),basePower:bp,priority:pri,hitInfo:readHitInfo(name,raw),source:dataCategory?'native':categoryInferred?'inferred power':category?'reference':'unknown',isStatus:specialStatus};
   }
   // Gen 4 type chart: attack -> [super effective, resisted, immune].
   const CHART={
@@ -666,52 +669,69 @@
     if(recognized.some(x=>x===null)||!recognized.length)return null;
     return Object.fromEntries(FLAG_KEYS.map(f=>[f,recognized.includes(f)]));
   }
+  // Visible flag pills can be rendered *beside* the enemy fieldset, not
+  // necessarily within #p2. Collect exact-label leaves and choose the
+  // nearest cohesive group to the selected enemy. Do not mistake unrelated
+  // explanatory text or our own flag-assumption controls for trainer flags.
   function readVisibleFlagBadges(doc){
-    const roots=['#p2','#p2info','.trainer-ai-flags','#ai-flags-container','#aiFlags'];
-    let best=null;
-    for(const sel of roots){
-      const root=doc.querySelector(sel);
-      if(!root?.querySelectorAll)continue;
-      const all=Array.from(root.querySelectorAll('span,div,button,label,li,small,b,strong'));
-      const chips=[];
-      for(const el of all){
-        if(el.closest?.('#pkai-context,.pkai-inline-odds'))continue;
-        if(el.hidden || el.getAttribute?.('aria-hidden')==='true')continue;
-        const label=flatKey(el.textContent);
-        if(!label||!FLAG_KEYS.some(f=>flagSynonyms[f].includes(label)))continue;
-        // Prefer a leaf: otherwise both the badge and its wrapper are counted.
-        if(Array.from(el.children||[]).some(child=>flatKey(child.textContent)===label))continue;
-        chips.push({el,label});
+    const enemy=doc.querySelector('#p2 .set-selector')||doc.querySelector('#p2');
+    const panel=doc.querySelector('#p2')?.closest('.panel')||doc.querySelector('.panel-right');
+    const roots=[doc.querySelector('#p2'),panel,doc.querySelector('.trainer-ai-flags'),
+      doc.querySelector('#ai-flags-container'),doc.querySelector('#aiFlags'),doc.body]
+      .filter(Boolean);
+    const targetRect=enemy?.getBoundingClientRect?.();
+    const unique=new Set();
+    const candidates=[];
+    for(const root of roots){
+      for(const el of root.querySelectorAll('span,div,button,label,li,small,b,strong,a,p')){
+        if(unique.has(el))continue;
+        unique.add(el);
+        if(el.closest?.('#pkai-context,.pkai-inline-odds,template,[hidden]'))continue;
+        if(el.getAttribute?.('aria-hidden')==='true')continue;
+        // A badge may wrap its text in a smaller element; accept only the leaf.
+        const raw=String(el.textContent||'').trim();
+        const label=flatKey(raw);
+        const flag=FLAG_KEYS.find(f=>flagSynonyms[f].includes(label));
+        if(!flag)continue;
+        if([...el.children||[]].some(ch=>flatKey(ch.textContent)===label))continue;
+        if(el.getClientRects?.().length===0 && el.ownerDocument?.defaultView?.getComputedStyle &&
+           el.ownerDocument.defaultView.getComputedStyle(el).display==='none')continue;
+        candidates.push({el,flag});
       }
-      // The AI flags are a contiguous run of badges. Find their smallest
-      // shared container, rather than interpreting an arbitrary whole page.
-      const buckets=new Map();
-      for(const {el,label} of chips){
-        let parent=el.parentElement;
-        for(let depth=0;parent&&depth<5;depth++,parent=parent.parentElement){
-          if(parent===root.parentElement)break;
-          const text=String(parent.textContent||'').trim();
-          if(text.length>220)break;
-          if(!buckets.has(parent))buckets.set(parent,new Set());
-          buckets.get(parent).add(label);
-          if(parent===root)break;
-        }
-      }
-      for(const [el,labelSet] of buckets){
-        const labels=[...labelSet];
-        const complete=parseVisibleFlagLabels(labels);
-        if(!complete)continue;
-        const flagged=/(ai[-_ ]?flags?|trainer[-_ ]?ai)/i.test(String(el.className||'')+' '+String(el.id||''));
-        // Require at least two chips unless the container explicitly says AI flags.
-        if(labels.length<2&&!flagged)continue;
-        const len=String(el.textContent||'').length;
-        const merit=labels.length*1000-len;
-        if(!best||merit>best.merit)best={flags:complete,
-          source:'visible AI flag badges ('+sel+')',merit};
+      // Avoid scanning the entire 2,000-element calculator after locating a
+      // complete group close to the enemy panel.
+      if(new Set(candidates.map(x=>x.flag)).size>=2 && root!==doc.body)break;
+    }
+    if(!candidates.length)return null;
+    const buckets=new Map();
+    for(const {el,flag} of candidates){
+      let parent=el.parentElement;
+      for(let depth=0;parent&&depth<7;depth++,parent=parent.parentElement){
+        if(parent.closest?.('#pkai-context'))break;
+        if(String(parent.textContent||'').length>900)break;
+        let flags=buckets.get(parent);
+        if(!flags){flags=new Set();buckets.set(parent,flags);}
+        flags.add(flag);
       }
     }
-    return best?{flags:best.flags,source:best.source}:null;
+    let best=null;
+    for(const [container,found] of buckets){
+      if(found.size<2)continue;
+      const text=String(container.textContent||'').trim();
+      const rect=container.getBoundingClientRect?.();
+      const distance=targetRect&&rect ?
+        Math.abs((rect.top+rect.bottom)/2-(targetRect.top+targetRect.bottom)/2):0;
+      const locationBonus=doc.querySelector('#p2')?.contains(container)?800:
+        (panel?.contains(container)?400:0);
+      // A row of short pills beats a whole form, even if both contain keywords.
+      const merit=found.size*2000+locationBonus-Math.min(2000,distance*2)-text.length;
+      if(!best||merit>best.merit)best={flags:found,merit,container};
+    }
+    if(!best)return null;
+    return {flags:Object.fromEntries(FLAG_KEYS.map(k=>[k,best.flags.has(k)])),
+      source:'visible trainer AI badges adjacent to enemy set'};
   }
+
   function readTrainerFlags(doc,globals={}){
     // What the player currently sees takes precedence over stale global sets.
     const badges=readVisibleFlagBadges(doc);
@@ -1123,7 +1143,7 @@
   'use strict';
   const doc=document;
   if(!doc.body||!globalThis.PKAI||!globalThis.PKAICalcAdapter||!globalThis.PKAIContext)return;
-  if(doc.getElementById('pkai-context')?.dataset?.pkaiVersion==='1.2.0')return;
+  if(doc.getElementById('pkai-context')?.dataset?.pkaiVersion==='1.3.0')return;
   // Replace a stale panel from the previous release, if both scripts were loaded.
   doc.getElementById('pkai-context')?.remove();
   const adapter=globalThis.PKAICalcAdapter,engine=globalThis.PKAI,context=globalThis.PKAIContext;
@@ -1215,7 +1235,7 @@
     const result=doc.querySelector('.results-right')||doc.querySelector('.move-result-subgroup')||doc.querySelector('.move-result-group');
     return result?.parentElement||doc.querySelector('#p2')||doc.body;
   }
-  const panel=create('section',null);panel.id='pkai-context';panel.dataset.pkaiVersion='1.2.0';panel.setAttribute('aria-label','AI scoring context');
+  const panel=create('section',null);panel.id='pkai-context';panel.dataset.pkaiVersion='1.3.0';panel.setAttribute('aria-label','AI scoring context');
   contextHost().appendChild(panel);
   function attachPanel(){
     const host=contextHost();if(panel.parentNode!==host)host.appendChild(panel);
@@ -1332,23 +1352,54 @@
         'Cannot calculate: '+(blockers[0]||'missing battle data')+'. See AI scoring context below the moves.';
     }
   }
-  function hardBlockers(state){
-    const b=[],add=s=>{if(!b.includes(s))b.push(s);};
-    if(!state.flags)add('Trainer AI flags unavailable: select them below, or expose them in trainer data.');
-    if(!Number.isFinite(state.hp)||!Number.isFinite(state.maxHp)||state.maxHp<=0||
-      (state.targets||[]).some(t=>!Number.isFinite(t.hp)||!Number.isFinite(t.maxHp)||t.maxHp<=0))add('Current/max HP not readable from the calculator');
-    if(state.targets?.length===2 && ![1,2].includes(state.allyTypes?.length))add('Doubles ally types unavailable in calculator');
-    for(const move of state.moves||[]){
-      if(!move?.name||['nomove','loading'].includes(key(move.name)))continue;
-      if(!['Physical','Special','Status'].includes(move.category))add('Unknown move category: '+move.name);
-      if(move.category!=='Status')for(let t=0;t<state.targets.length;t++){
-        if(move.damage?.[t]==null && !['closecombat','bravebird','focuspunch','headsmash','takedown','explosion','selfdestruct'].includes(key(move.name)))
-          add('AI damage estimate missing for '+move.name+' against opponent '+(t+1));
-        if(move.effectiveness?.[t]==null)add('Type effectiveness missing for '+move.name);
+  // A single unfamiliar move must not make the other three disappear.
+  // For incomplete slots, score a clearly labelled *conditional* scenario:
+  // unknown move damage is treated as no KO, and unknown type as neutral.
+  // Never return this scenario as cartridge-accurate odds.
+  function prepareScoringState(state){
+    const warnings=[];
+    const b=[];
+    const moves=(state.moves||[]).map(m=>{
+      if(!m||!m.name||['nomove','loading'].includes(key(m.name)))return m;
+      let next={...m,damage:[...(m.damage||[])],effectiveness:[...(m.effectiveness||[])]};
+      if(!['Physical','Special','Status'].includes(next.category)){
+        warnings.push('Unrecognized move category for '+m.name+': treated as '+
+          (Number(m.basePower)>0?'an attack':'a status move')+'.');
+        next.category=Number(m.basePower)>0?'Physical':'Status';
+      }else if(next.source==='inferred power'){
+        warnings.push('Move category for '+m.name+' inferred from displayed base power.');
       }
-    }
-    return b;
+      if(next.category!=='Status')for(let i=0;i<(state.targets||[]).length;i++){
+        if(!Number.isFinite(Number(next.effectiveness[i]))||next.effectiveness[i]==null){
+          warnings.push(m.name+' type-effectiveness unavailable vs opponent '+(i+1)+'; assuming neutral.');
+          next.effectiveness[i]=1;
+        }
+        if(next.damage[i]==null||!Number.isFinite(Number(next.damage[i]))){
+          warnings.push(m.name+' AI damage unavailable vs opponent '+(i+1)+
+            '; conditional scenario assumes it does not KO.');
+          next.damage[i]=0;
+        }
+      }
+      return next;
+    });
+    if(!state.flags)b.push('Trainer AI flags not found');
+    if(!Number.isFinite(state.hp)||!Number.isFinite(state.maxHp)||state.maxHp<=0||
+       (state.targets||[]).some(t=>!Number.isFinite(t.hp)||!Number.isFinite(t.maxHp)||t.maxHp<=0))
+      b.push('Current/max HP not readable from the calculator');
+    if(state.targets?.length===2 && ![1,2].includes(state.allyTypes?.length))
+      b.push('Doubles ally types unavailable in calculator');
+    const attacks=moves.filter(m=>m?.name&&m.category!=='Status'&&
+      !['nomove','loading'].includes(key(m.name)));
+    if(attacks.length && attacks.every(m=>(state.moves.find(x=>x.name===m.name)?.damage||[])
+      .every(d=>d==null||!Number.isFinite(Number(d)))) &&
+      attacks.some(m=>!['explosion','selfdestruct'].includes(key(m.name))))
+      b.push('All attacking move damage results are unavailable; wait for calculator to finish loading');
+    if(!moves.some(m=>m?.name&&!['nomove','loading'].includes(key(m.name))))
+      b.push('No Pokémon 2 moves found yet');
+    return {state:{...state,moves},blockers:b,warnings:[...new Set(warnings)]};
   }
+  function hardBlockers(state){return prepareScoringState(state).blockers;}
+
   function refreshView(){
     if(refreshing)return;refreshing=true;
     try{
@@ -1369,11 +1420,14 @@
       const applicable=context.descriptorsFor(state);
       const unresolved=applicable.filter(x=>inputValue(store,x.id)==null);
       if(unresolved.length)notes.push(unresolved.length+' history/field conditions remain unknown.');
-      const blockers=hardBlockers(state);
+      const prepared=prepareScoringState(state);
+      const blockers=prepared.blockers;
+      if(prepared.warnings.length)notes.push('CONDITIONAL SCORING: '+prepared.warnings.join(' '));
       let result=null;
-      if(!blockers.length){try{result=engine.calculate(state);}catch(e){blockers.push(e.message||String(e));}}
+      if(!blockers.length){try{result=engine.calculate(prepared.state);}catch(e){blockers.push(e.message||String(e));}}
       const missing=unresolved.map(x=>x.label+' (not provided by calculator)');
-      latest={snapshot:{...snapshot,state,flagsSource},missing,blockers,result,notes,controls:applicable};
+      latest={snapshot:{...snapshot,state,flagsSource},missing,blockers,result,notes,controls:applicable,
+        scoringState:prepared.state,readingWarnings:prepared.warnings};
       paintInline(latest.snapshot,result,blockers,notes);
       renderPanel({...snapshot,state:original,flagsSource},applicable,missing,blockers,result,notes);
     }catch(e){
@@ -1405,11 +1459,13 @@
   observer.observe(doc.body,{subtree:true,childList:true,characterData:true});
   doc.addEventListener('input',e=>{if(!isOwn(e.target))queue();},true);
   doc.addEventListener('change',e=>{if(!isOwn(e.target))queue();},true);
-  globalThis.PKAIInline={version:'1.2.0',refresh:refreshView,snapshot:()=>latest?.snapshot?.state,
+  globalThis.PKAIInline={version:'1.3.0',refresh:refreshView,snapshot:()=>latest?.snapshot?.state,
     locations:locateInline,diagnostics:()=>latest?.error?[latest.error]:[...(latest?.blockers||[]),...(latest?.missing||[]),...(latest?.notes||[])],
     controls:()=>latest?.controls||[],
     flagSource:()=>latest?.snapshot?.flagsSource,
-    blockers:()=>latest?.blockers||[]};
+    blockers:()=>latest?.blockers||[],
+    readingWarnings:()=>latest?.readingWarnings||[],
+    flagRead:()=>adapter.readTrainerFlags(doc,globalThis)};
   refreshView();
 })();
 
