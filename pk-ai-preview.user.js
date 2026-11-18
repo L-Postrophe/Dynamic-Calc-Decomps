@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Platinum Kaizo AI Odds — verified damage and flag scoring
 // @namespace    https://github.com/hzla/Dynamic-Calc-Decomps
-// @version      1.13.0
+// @version      1.19.0
 // @description  Inline AI odds; Doubles board, partner targeting, AI damage approximation and all eleven flags.
 // @match        https://hzla.github.io/Dynamic-Calc-Decomps/*
 // @match        https://l-postrophe.github.io/Dynamic-Calc-Decomps/*
@@ -1831,7 +1831,7 @@
       };
     }
     if(!state.targets.some(t=>!t.isAlly&&t.hp>0))throw new Error('Supply a living opponent');
-    if(!state.moves.some(m=>m.usable!==false&&m.currentPP!==0))throw new Error('No selectable moves (Struggle/switch decision is outside this preview)');
+    if(!state.moves.some(m=>m.usable!==false&&m.currentPP!==0))throw new Error('No selectable moves (Struggle prediction is not implemented)');
     if(state.ally&&state.ally.hp>0&&!state.targets.some(t=>t.isAlly)&&(state.flags?.doubles||state.flags?.checkHP)){
       state={...state,targets:[...state.targets,{...state.ally,isAlly:true,name:state.ally.name||'AI partner'}]};
     }
@@ -1888,6 +1888,152 @@
   }
   return {calculate, runScore, basicScore, expertScore, doublesScore, allyScore, checkHpDistribution, targetOutcomes, chance, convolve, pct, nameKey, rules:RULES};
 });
+
+/* Gen 4 voluntary switching and replacement selection.
+ * Ported from pret/pokeplatinum trainer_ai.c: TrainerAI_ShouldSwitch and
+ * battle_lib.c: BattleAI_PostKOSwitchIn. Ordered checks and repeated random
+ * tests are intentional; several source comments disagree with the code.
+ * Damage/effectiveness are supplied by the calculator, not a matchup heuristic.
+ */
+(function(root){
+  'use strict';
+  const key=x=>String(x||'').toLowerCase().replace(/[^a-z0-9]/g,'');
+  const valid=m=>m&&m.name&&!['nomove','none','loading'].includes(key(m.name));
+  const attacks=p=>(p.moves||[]).filter(m=>valid(m)&&Number(m.basePower)>0);
+  const moves=p=>(p.moves||[]).filter(valid);
+  const powerOne=new Set(('Bide,Counter,Crush Grip,Dragon Rage,Endeavor,Fissure,Flail,Fling,Frustration,Grass Knot,Guillotine,Gyro Ball,Hidden Power,Horn Drill,Low Kick,Metal Burst,Mirror Coat,Natural Gift,Night Shade,Present,Psywave,Punishment,Return,Reversal,Seismic Toss,Sheer Cold,SonicBoom,Spit Up,Super Fang,Trump Card,Wring Out').split(',').map(key));
+  function ignored(m){return Number(m.basePower)===1||powerOne.has(key(m.name))||/^(hp|hiddenpower)(fire|water|grass|ice|electric|ground|rock|fighting|flying|ghost|dark|psychic|steel|bug|poison|dragon)$/.test(key(m.name));}
+  function effectiveness(a,m,t,c={}){
+    if(c.effectiveness)return c.effectiveness(a,m,t);
+    if(key(m.name)==='curse')return 1; // Gen 4 Mystery typing never flags super-effective.
+    let type=m.switchType||m.type;
+    if(!root.PKAICalcAdapter?.TYPES.includes(type)&&root.calc?.Move){
+      try{type=new root.calc.Move(4,m.name).type;c.onAssumption?.('Switch typing for '+m.name+' uses the native Gen 4 move type.');}catch{}
+    }
+    let e=root.PKAICalcAdapter?.typeEffectiveness(a.ability==='Normalize'?'Normal':type,t.types);
+    if(e==null)throw Error('Switch effectiveness unavailable');
+    if(a.ability!=='Mold Breaker'){
+      if(m.type==='Ground'&&t.ability==='Levitate'&&!c.gravity&&t.item!=='Iron Ball')e=0;
+      if(t.ability==='Wonder Guard'&&Number(m.basePower)>0&&e<=1)e=0;
+    }
+    return e;
+  }
+  function phase2ScoreFromResult(result){
+    const d=result?.rawDesc;
+    if(Number.isFinite(d?.g4Phase2Score))return d.g4Phase2Score;
+    if(!Number.isFinite(d?.g4Phase2BaseDamage))return null;
+    const divide=(a,b)=>a===0?0:Math.trunc(a/b)||Math.sign(a);
+    let n=d.g4Phase2BaseDamage&255;
+    if(d.g4Phase2StabMod===2)n*=2;else if(d.g4Phase2StabMod===1.5)n=Math.floor(n*15/10);
+    for(const e of [d.g4Phase2Type1Effectiveness,d.g4Phase2Type2Effectiveness]){
+      if(e===0)n=0;else if(e===.5)n=divide(n*5,10);else if(e===2)n=divide(n*20,10);
+    }
+    if(d.g4Phase2FilterMod===.75)n=divide(n*3,4);
+    for(const field of ['g4Phase2ExpertBeltMod','g4Phase2TintedMod','g4Phase2BerryMod'])if(d[field]&&d[field]!==1)n=Math.floor(n*d[field]);
+    return n&255;
+  }
+  function replacement(c){
+    const party=c.party.filter(p=>p.hp>0&&!p.excluded),targets=c.targets.filter(p=>p.hp>0),out=new Map();
+    const add=(id,name,p,reason)=>{const old=out.get(id)||{id,name,probability:0,reasons:[]};old.probability+=p;old.reasons.push(reason);out.set(id,old);};
+    if(!party.length)return [];
+    for(const target of targets){
+      const left=[...party];let stale=0,picked=null;
+      while(left.length){
+        let best=0,candidate=null;
+        for(const p of left){const types=p.types||[];const first=types[0],second=types[1]||first;
+          // The source holds the offensive-type score in a u8.
+          stale=(Math.floor(40*root.PKAICalcAdapter.typeEffectiveness(first,target.types))+Math.floor(40*root.PKAICalcAdapter.typeEffectiveness(second,target.types)))&255;
+          if(stale>best){best=stale;candidate=p;}
+        }
+        if(!candidate)break;
+        if(moves(candidate).some(m=>effectiveness(candidate,m,target,c)>1)){picked=candidate;break;}
+        left.splice(left.indexOf(candidate),1);
+      }
+      let reason='Replacement phase 1 against '+target.name;
+      if(!picked){
+        let max=0;reason='Replacement phase 2 against '+target.name;
+        outer:for(const p of party)for(const m of p.moves||[]){
+          if(valid(m)&&!ignored(m)){
+            const score=c.phase2Score?.(c.actor,m,target);
+            if(!Number.isFinite(score)){picked={id:'unknown',name:'Replacement needs native damage'};reason='Replacement phase 2 damage unavailable';break outer;}
+            stale=score&255;
+          }
+          // Power-one / empty slots retain the previous score (including the
+          // stale final phase-1 score on the first phase-2 move).
+          if(max<stale){max=stale;picked=p;}
+        }
+        if(!picked){picked=party[0];reason='Replacement fallback: first eligible party slot';}
+      }
+      add(picked.id,picked.name,1/targets.length,reason);
+    }
+    return [...out.values()];
+  }
+  function predict(c){
+    const actor=c.actor,party=(c.party||[]).filter(p=>p.hp>0&&!p.excluded),history=c.history||{},missing=[],notes=[];
+    const out=new Map();let remaining=1,stay=0;
+    const add=(p,q,reason)=>{if(q<=1e-15)return;const id=p.id||p.name,old=out.get(id)||{id,name:p.name,probability:0,reasons:[]};old.probability+=q;old.reasons.push(reason);out.set(id,old);};
+    const finish=(reason)=>({known:!missing.length,switchProbability:missing.length?null:[...out.values()].reduce((n,x)=>n+x.probability,0),stayProbability:missing.length?null:stay+remaining,choices:[...out.values()],reason,missing,notes});
+    if(c.partyKnown!==true){missing.push('Choose or confirm this trainer’s remaining party.');return finish('Party unknown');}
+    if(!party.length)return finish('No eligible living reserves');
+    const targets=c.targets||[],all=[...targets,c.ally].filter(p=>p&&p.hp>0);
+    const blocked=history.trapped===true||history.ingrain===true||targets.some(t=>t.hp>0&&['Shadow Tag','Arena Trap'].includes(t.ability))||
+      ((actor.types||[]).includes('Steel')&&all.some(t=>t.ability==='Magnet Pull'));
+    if(blocked&&actor.hp>0)return finish('Switch blocked by trapping / Ingrain / trapping ability');
+    for(const field of actor.hp<=0?[]:['trapped','ingrain','perishTurns','lastMove'])if(history[field]==null)missing.push('Set '+field+' in switch history.');
+    if(missing.length)return finish('Switch history incomplete');
+    const stage=(attempts,reason,gate=1)=>{
+      let mass=remaining*gate;const bypass=remaining*(1-gate);
+      for(const [p,chance]of attempts){const q=mass*chance;add(p,q,reason);mass-=q;}
+      remaining=bypass+mass;
+    };
+    const post=(prob,reason)=>{const mass=remaining*prob;const choices=replacement({...c,party});if(!choices.length){missing.push('No living opposing Pokémon for replacement ranking.');return;}
+      for(const r of choices)add(r,mass*r.probability,reason+'; '+r.reasons.join(' / '));remaining-=mass;};
+    if(actor.hp<=0){post(1,'Fainted: replacement required');return finish('Forced replacement');}
+    if(history.perishTurns===0){post(1,'Perish Song counter is already zero');return finish('Perish Song');}
+    // The game decrements Perish Song after this check; counter 1 does NOT
+    // proactively cause a switch, even though it will faint at turn end.
+    if(c.format!=='Doubles'&&targets[0]?.ability==='Wonder Guard'&&!moves(actor).some(m=>effectiveness(actor,m,targets[0],c)>1)){
+      stage(party.flatMap(p=>moves(p).filter(m=>effectiveness(p,m,targets[0],c)>1).map(()=>[p,2/3])),'Cannot damage Wonder Guard');
+    }
+    // OnlyIneffectiveMoves uses the fixed PLAYER slots in the decomp, even
+    // when the acting AI is the player-side partner. Preserve that quirk.
+    const ineffectiveTargets=c.ineffectiveTargets||targets,as=attacks(actor);
+    if(as.length>=2&&as.every(m=>ineffectiveTargets.every(t=>t.hp>0&&effectiveness(actor,m,t,c)===0))){
+      stage(party.flatMap(p=>attacks(p).flatMap(m=>ineffectiveTargets.filter(t=>t.hp>0&&effectiveness(p,m,t,c)>1).map(()=>[p,2/3]))),'Only ineffective attacks: super-effective reserve');
+      stage(party.flatMap(p=>attacks(p).flatMap(m=>ineffectiveTargets.filter(t=>t.hp<=0||effectiveness(p,m,t,c)===1).map(()=>[p,.5]))),'Only ineffective attacks: neutral reserve');
+    }
+    const last=history.lastMove==='None'?null:history.lastMove,source=history.source;
+    if(last&&Number(last.basePower)>0){
+      const absorb={Fire:'Flash Fire',Water:'Water Absorb',Electric:'Volt Absorb'}[last.type];
+      if(absorb&&actor.ability!==absorb){const hasSE=moves(actor).some(m=>targets.some(t=>t.hp>0&&!t.switching&&effectiveness(actor,m,t,c)>1));
+        stage(party.filter(p=>p.ability===absorb).map(p=>[p,.5]),'Absorber for the last damaging move',hasSE?1/3:1);
+      }
+    }
+    function resistAttempts(kind,chance){
+      if(!last||Number(last.basePower)<=0||!source)return [];
+      return party.filter(p=>{const e=effectiveness(source,last,p,c);return kind==='immune'?e===0:e>0&&e<1;})
+        .flatMap(p=>moves(p).filter(m=>effectiveness(p,m,source,c)>1).map(()=>[p,chance]));
+    }
+    if(actor.ability==='Natural Cure'&&['asleep','sleep','slp'].includes(key(actor.status))&&actor.hp>=Math.floor(actor.maxHp/2)){
+      if(!last)post(.5,'Natural Cure: no prior hit, first coin flip');
+      if(!last||Number(last.basePower)===0)post(.5,'Natural Cure: non-damaging last move');
+      if(last&&Number(last.basePower)>0&&!source){missing.push('Identify the battler whose move last hit this Pokémon.');return finish('Last attacker unknown');}
+      stage(resistAttempts('immune',1),'Natural Cure: immune reserve with a super-effective move');
+      stage(resistAttempts('resist',1),'Natural Cure: resistant reserve with a super-effective move');
+      post(.5,'Natural Cure: final coin flip');
+    }
+    const seCount=moves(actor).reduce((n,m)=>n+targets.filter(t=>t.hp>0&&!t.switching&&effectiveness(actor,m,t,c)>1).length,0);
+    const proceed=Math.pow(.1,seCount);stay+=remaining*(1-proceed);remaining*=proceed;
+    if(Object.values(actor.stages||{}).reduce((n,v)=>n+Math.max(0,Number(v)||0),0)>=4){stay+=remaining;remaining=0;return finish('Four or more positive stat stages');}
+    if(last&&Number(last.basePower)>0&&!source&&remaining>1e-14){missing.push('Identify the battler whose move last hit this Pokémon.');return finish('Last attacker unknown');}
+    stage(resistAttempts('immune',.5),'Immune reserve with a super-effective move (source % 2 test)');
+    stage(resistAttempts('resist',1/3),'Resistant reserve with a super-effective move (source % 3 test)');
+    notes.push('Gen 4 switching model; random modulo tests use uniform fractions.');
+    return finish('Ordered Gen 4 switch checks');
+  }
+  root.PKAISwitch={predict,replacement,effectiveness,ignored,phase2ScoreFromResult};
+})(typeof globalThis!=='undefined'?globalThis:this);
+
 
 /* Adapter for hzla's Dynamic Calc DOM (p1 = player, p2 = enemy).
  * Never silently invent battle inputs: use null for unavailable state.
@@ -2400,6 +2546,10 @@
     if(toggle && !toggle.checked)item='';
     const weather=readWeather(doc);
     const tailwind=readBoolean(doc,[`#tailwind${side.charAt(0)}`]);
+    return speedFromState({base,stage,rawStatus,ability,item,weather,tailwind});
+  }
+  function speedFromState({base,stage,rawStatus,ability,item,weather,tailwind}){
+    ability=flatKey(ability);item=flatKey(item);
     if(base==null || !Number.isFinite(base) || stage==null || rawStatus==null || tailwind==null)
       return {value:null,reason:'Base Speed, stat boosts, status, or Tailwind missing'};
     if(!Number.isInteger(stage)||Math.abs(stage)>6)
@@ -2416,7 +2566,7 @@
     let result=boosted;
     const status=flatKey(rawStatus);
     const hasStatus=!['','healthy','none','nostatus','confused'].includes(status);
-    if(status==='paralyzed' && ability!=='quickfeet')result=Math.floor(result/4);
+    if(['par','paralyzed'].includes(status) && ability!=='quickfeet')result=Math.floor(result/4);
     if(ability==='quickfeet' && hasStatus)result=Math.floor(result*1.5);
     if(ability==='swiftswim' && weather==='Rain')result*=2;
     if(ability==='chlorophyll' && weather==='Sun')result*=2;
@@ -2622,7 +2772,7 @@
     return {state,issues,source:trainer.source};
   }
 
-  return {possibleAbilities,aiEffectiveness,approximateDamage,captureNative,nativeAIDamage,TYPES,fromSide,readTypes,readAbility,readStatus,readItem,readBoosts,readSpeed,readFormat,readWeather,readTrickRoom,moveMetadata,typeEffectiveness,parseDamage,parseDamageDetail,numeric:number,decodeFlags,parseVisibleFlagLabels,readVisibleFlagBadges,readTrainerFlags,rawDamageFromText,readBoolean,readFieldState,readHistory,readAttackOrder,effectiveSpeed,readNativeDamage,readAIDamage,readHitInfo,readBattle};
+  return {possibleAbilities,aiEffectiveness,approximateDamage,captureNative,nativeAIDamage,TYPES,fromSide,readTypes,readAbility,readStatus,readItem,readBoosts,readSpeed,readFormat,readWeather,readTrickRoom,moveMetadata,typeEffectiveness,parseDamage,parseDamageDetail,numeric:number,decodeFlags,parseVisibleFlagLabels,readVisibleFlagBadges,readTrainerFlags,rawDamageFromText,readBoolean,readFieldState,readHistory,readAttackOrder,effectiveSpeed,speedFromState,readNativeDamage,readAIDamage,readHitInfo,readBattle};
 });
 
 /* Optional battle context that a static damage calculator cannot always know.
@@ -2714,7 +2864,7 @@
     knowsDrain:{label:'Target knows draining move'},
     itemEncouraged:{label:'Target item has an encouraged Thief/Covet hold effect',detail:'Expert: Thief and Covet'},
     benchNeeded:{label:'AI reserve Pokémon needs healing'},
-    abilityKnown:{label:'AI has confirmed this opponent’s ability'},
+    abilityKnown:{label:'Has this Pokémon’s ability been revealed to the enemy AI?'},
     knowsSleepTalkSnore:{label:'Opponent knows Sleep Talk or Snore'},
     knowsHighCritMove:{label:'Opponent knows a high critical-hit move'},
     foresight:{label:'Opponent identified by Foresight / Odor Sleuth'},
@@ -2861,8 +3011,9 @@
   if(typeof document==='undefined')return;
   const doc=document;
   if(!doc.body||!globalThis.PKAI||!globalThis.PKAICalcAdapter||!globalThis.PKAIContext)return;
-  if(doc.getElementById('pkai-context')?.dataset?.pkaiVersion==='1.13.0')return;
+  if(doc.getElementById('pkai-context')?.dataset?.pkaiVersion==='1.19.0')return;
   // Replace a stale panel from the previous release, if both scripts were loaded.
+  globalThis.PKAIInline?.dispose?.();
   doc.getElementById('pkai-context')?.remove();
   const adapter=globalThis.PKAICalcAdapter,engine=globalThis.PKAI,context=globalThis.PKAIContext;
   const create=(tag,text,cls)=>{
@@ -2877,28 +3028,56 @@
       font:inherit!important;margin:0 5px!important;display:inline-block!important;float:none!important;
       width:auto!important;max-width:none!important;overflow:visible!important;visibility:visible!important;opacity:1!important;vertical-align:baseline!important}
     .pkai-inline-odds[data-pkai-placement="fallback"]{font-size:11px!important}
-    #pkai-context{margin:12px 0;padding:12px 14px;border:1px solid #9ba9b9;border-radius:9px;
+    :is(#pkai-context,#pkai-battlefield-dock){margin:12px 0;padding:12px 14px;border:1px solid #9ba9b9;border-radius:9px;
       background:var(--pkai-bg,transparent);font:12px/1.45 system-ui,Arial,sans-serif;color:inherit;max-width:100%;box-sizing:border-box}
-    #pkai-context .pkai-header{display:flex;gap:8px;align-items:center;justify-content:space-between;font-weight:700;font-size:13px;margin-bottom:4px}
-    #pkai-context .pkai-help{opacity:.78;font-size:11px;margin:4px 0 9px}
-    #pkai-context .pkai-fields{display:flex;flex-wrap:wrap;gap:7px 14px;align-items:center}
-    #pkai-context fieldset{border:1px solid #b7c0cb;border-radius:6px;min-width:180px;max-width:100%;margin:5px 0;padding:6px 8px 8px}
-    #pkai-context legend{font-weight:650;padding:0 4px}
-    #pkai-context .pkai-line{display:flex;align-items:center;gap:6px;min-height:24px;flex-wrap:wrap}
-    #pkai-context .pkai-line label{cursor:pointer;display:flex;align-items:center;gap:6px}
-    #pkai-context input[type="checkbox"]{appearance:auto!important;display:inline-block!important;
+    :is(#pkai-context,#pkai-battlefield-dock) .pkai-header{display:flex;gap:8px;align-items:center;justify-content:space-between;font-weight:700;font-size:13px;margin-bottom:4px}
+    :is(#pkai-context,#pkai-battlefield-dock) .pkai-help{opacity:.78;font-size:11px;margin:4px 0 9px}
+    :is(#pkai-context,#pkai-battlefield-dock) .pkai-fields{display:flex;flex-wrap:wrap;gap:7px 14px;align-items:center}
+    :is(#pkai-context,#pkai-battlefield-dock) fieldset{border:1px solid #b7c0cb;border-radius:6px;min-width:180px;max-width:100%;margin:5px 0;padding:6px 8px 8px}
+    :is(#pkai-context,#pkai-battlefield-dock) legend{font-weight:650;padding:0 4px}
+    :is(#pkai-context,#pkai-battlefield-dock) .pkai-line{display:flex;align-items:center;gap:6px;min-height:24px;flex-wrap:wrap}
+    :is(#pkai-context,#pkai-battlefield-dock) .pkai-line label{cursor:pointer;display:flex;align-items:center;gap:6px}
+    :is(#pkai-context,#pkai-battlefield-dock) input[type="checkbox"]{appearance:auto!important;display:inline-block!important;
       position:static!important;opacity:1!important;visibility:visible!important;
       width:16px!important;height:16px!important;flex:none;accent-color:#14869c;cursor:pointer}
-    #pkai-context select{max-width:190px;font:inherit;border:1px solid #a1afc2;border-radius:4px;padding:2px;background:Canvas;color:CanvasText}
-    #pkai-context .pkai-unknown{font-size:10px;opacity:.72}
-    #pkai-context .pkai-reset{font:inherit;font-size:11px;border:0;background:transparent;color:inherit;opacity:.7;cursor:pointer;padding:2px}
-    #pkai-context .pkai-reset:disabled{opacity:.25;cursor:default}
-    #pkai-context .pkai-warning{font-size:11px;color:#956010;overflow-wrap:anywhere}
-    #pkai-context .pkai-flag-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:5px 10px}
-    #pkai-context details{margin-top:5px}
-    #pkai-context summary{cursor:pointer}
-    #pkai-context ul{margin:5px 0 0;padding-left:18px}
-    #pkai-context .pkai-approx{font-size:11px;margin-top:7px;opacity:.75}
+    :is(#pkai-context,#pkai-battlefield-dock) select{max-width:190px;font:inherit;border:1px solid #a1afc2;border-radius:4px;padding:2px;background:Canvas;color:CanvasText}
+    :is(#pkai-context,#pkai-battlefield-dock) .pkai-unknown{font-size:10px;opacity:.72}
+    :is(#pkai-context,#pkai-battlefield-dock) .pkai-reset{font:inherit;font-size:11px;border:0;background:transparent;color:inherit;opacity:.7;cursor:pointer;padding:2px}
+    :is(#pkai-context,#pkai-battlefield-dock) .pkai-reset:disabled{opacity:.25;cursor:default}
+    :is(#pkai-context,#pkai-battlefield-dock) .pkai-warning{font-size:11px;color:#956010;overflow-wrap:anywhere}
+    :is(#pkai-context,#pkai-battlefield-dock) .pkai-flag-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:5px 10px}
+    :is(#pkai-context,#pkai-battlefield-dock) details{margin-top:5px}
+    :is(#pkai-context,#pkai-battlefield-dock) summary{cursor:pointer}
+    :is(#pkai-context,#pkai-battlefield-dock) ul{margin:5px 0 0;padding-left:18px}
+    :is(#pkai-context,#pkai-battlefield-dock) .pkai-approx{font-size:11px;margin-top:7px;opacity:.75}
+    :is(#pkai-context,#pkai-battlefield-dock) .pkai-battle-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin:8px 0}
+    :is(#pkai-context,#pkai-battlefield-dock) .pkai-slot{border:1px solid #aebac8;border-top:3px solid #37889b;border-radius:7px;padding:10px;min-width:0;overflow-wrap:anywhere}
+    :is(#pkai-context,#pkai-battlefield-dock) .pkai-slot[data-team="enemy"]{border-top-color:#b56461}
+    :is(#pkai-context,#pkai-battlefield-dock) .pkai-slot h4{font-size:12px;margin:0 0 4px}
+    :is(#pkai-context,#pkai-battlefield-dock) .pkai-slot-name{font-size:15px;font-weight:700;margin-bottom:4px}
+    :is(#pkai-context,#pkai-battlefield-dock) .pkai-slot button{font:inherit;padding:5px 7px;margin:3px 4px 3px 0;cursor:pointer}
+    :is(#pkai-context,#pkai-battlefield-dock) .pkai-slot input[type="search"],:is(#pkai-context,#pkai-battlefield-dock) .pkai-slot select{box-sizing:border-box;width:100%;max-width:100%;margin:3px 0;padding:5px}
+    :is(#pkai-context,#pkai-battlefield-dock) .pkai-slot input[type="number"]{width:65px;font:inherit;padding:4px}
+    :is(#pkai-context,#pkai-battlefield-dock) .pkai-ready{padding:6px 8px;border-radius:5px;background:#14869c18}
+    :is(#pkai-context,#pkai-battlefield-dock) #pkai-battle-mode{max-width:100%;padding:5px;box-sizing:border-box}
+    :is(#pkai-context,#pkai-battlefield-dock) .pkai-setup-error{color:#ae3934}
+    :is(#pkai-context,#pkai-battlefield-dock) .pkai-target-table th,:is(#pkai-context,#pkai-battlefield-dock) .pkai-target-table td{padding:6px;border-bottom:1px solid #9ba9b944}
+    :is(#pkai-context,#pkai-battlefield-dock) .pkai-target-table th{text-align:right;font-size:11px}
+    :is(#pkai-context,#pkai-battlefield-dock) .pkai-target-table th:first-child,:is(#pkai-context,#pkai-battlefield-dock) .pkai-target-table td:first-child{text-align:left}
+    #pkai-battlefield-dock{display:block;clear:both;box-sizing:border-box;width:100%;margin:12px 0;color:inherit}
+    #pkai-battlefield-dock[hidden]{display:none!important}
+    #pkai-battlefield-dock .pkai-slot-sprite{float:right;width:64px;height:64px;object-fit:contain;image-rendering:pixelated}
+    #pkai-battlefield-dock [data-last-selected="true"]{box-shadow:0 0 0 2px #cfb8ff}
+    .pkai-selection-strip{display:block;clear:both;box-sizing:border-box;width:100%;padding:8px;margin:8px 0;background:#262b30;color:#f5f5f5;border:1px solid #8296ab;border-radius:8px;font:12px/1.3 sans-serif}
+    .pkai-selection-strip .pkai-mini-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:4px;margin-top:6px}
+    .pkai-selection-strip button{display:flex;flex-direction:column;align-items:center;min-width:0;padding:4px!important;border:1px solid #8296ab;border-radius:5px;background:#333b43;color:inherit;font:inherit;cursor:pointer;overflow-wrap:anywhere}
+    .pkai-selection-strip img{height:38px;width:48px;object-fit:contain;image-rendering:pixelated}
+    .pkai-selection-strip button[data-last-selected="true"]{border:2px solid #cfb8ff;background:#474052}
+    img.trainer-pok[data-pkai-slot]{outline:3px solid #7ed5ee!important;outline-offset:-3px;border-radius:7px}
+    img.trainer-pok[data-pkai-slot="b"]{outline-color:#f5d36c!important}
+    img.trainer-pok[data-pkai-slot="enemyLeft"],img.trainer-pok[data-pkai-slot="ally"]{outline-color:#f18b8b!important}
+    img.trainer-pok[data-pkai-last-click="true"]{box-shadow:0 0 0 3px #cfb8ff!important}
+    @media(max-width:540px){:is(#pkai-context,#pkai-battlefield-dock) .pkai-battle-grid{grid-template-columns:minmax(0,1fr)}}
   `;doc.head.appendChild(css);
   // Remove stale floating UI from an older script version if it is present.
   doc.getElementById('pkai-launcher')?.remove();doc.getElementById('pkai-dialog')?.remove();
@@ -2925,6 +3104,7 @@
     return String(el?.value||el?.selectedOptions?.[0]?.textContent||'');
   }
   function flagsKey(){
+    if(automatic()&&board().enemyLeft)return JSON.stringify([board().enemyLeft.meta?.tr_id,board().enemyLeft.setId]);
     const t=doc.querySelector('.trainer-pok-list .selected');
     const trainer=t?.dataset?.trainerId||doc.querySelector('#trainer')?.value||'';
     return JSON.stringify([String(trainer),selectedSet('#p2')]);
@@ -2957,16 +3137,35 @@
     const result=doc.querySelector('.results-right')||doc.querySelector('.move-result-subgroup')||doc.querySelector('.move-result-group');
     return result?.parentElement||doc.querySelector('#p2')||doc.body;
   }
-  const panel=create('section',null);panel.id='pkai-context';panel.dataset.pkaiVersion='1.13.0';panel.setAttribute('aria-label','AI scoring context');
+  const boardDock=create('section');boardDock.id='pkai-battlefield-dock';boardDock.hidden=true;
+  const panel=create('section',null);panel.id='pkai-context';panel.dataset.pkaiVersion='1.19.0';panel.setAttribute('aria-label','AI scoring context');
   contextHost().appendChild(panel);
   function attachPanel(){
-    const host=contextHost();if(panel.parentNode!==host)host.appendChild(panel);
+    // Native move-result columns float. Mount the battlefield outside them.
+    const anchor=doc.querySelector('.main-result-group')||doc.querySelector('.move-result-group');
+    if(anchor?.parentElement){
+      if(boardDock.previousElementSibling!==anchor)anchor.after(boardDock);
+      if(panel.previousElementSibling!==boardDock)boardDock.after(panel);
+    }else{
+      const host=contextHost();if(boardDock.parentNode!==host)host.appendChild(boardDock);
+      if(panel.parentNode!==host)host.appendChild(panel);
+    }
   }
-  const boards=new Map();
+  // Battlefield records survive selections in either editor. Tag battles route
+  // edits by trainer; true doubles retain explicit controls for the two allies.
+  const doublesBoard={a:null,b:null,ally:null,enemyLeft:null};
+  let autoAssign=true,modeChosen=false;
+  const trainerSlots={left:null,right:null,partner:null},seenEditors=new Map();
+  const pendingSelections=[];
+  let lastSelection=null;
+  const markedSprites=new Map(),selectionStrips=new Map();
+  const automatic=()=>tagBattle&&autoAssign;
+  let tagBattle=false,boardMessage='',catalogCache=null,catalogSource=null,battleTurn=null;
+  const actorSettings=new Map(),partyCache=new Map(),partyIndexCache=new Map(),reserveEdits=new Map();
   const unavailableMoves=new Map();
   const nativeCache=new Map();
   let approximationEnabled=true;
-  function board(){const id=flagsKey();if(!boards.has(id))boards.set(id,{a:null,b:null,ally:null});return boards.get(id);}
+  function board(){return doublesBoard;}
   function nativeFingerprint(side){
     return JSON.stringify([...doc.querySelectorAll('#'+(side==='R'?'p2':'p1')+' input, #'+(side==='R'?'p2':'p1')+' select')].map(e=>[e.id,e.className,e.value,e.checked]));
   }
@@ -2981,41 +3180,291 @@
   function scoringField(){
     try{const f=globalThis.createField?.();if(!f)return null;return f.swap?.()||f;}catch{return null;}
   }
-  function captureBoard(slot){
-    const snapshot=adapter.readBattle(doc,globalThis),state=snapshot.state,target=state.targets[0];
-    if(!Number.isFinite(target?.hp)||!Number.isFinite(target?.maxHp)||!target.types?.length)return;
-    const moves=Array.from({length:4},(_,i)=>adapter.moveMetadata(doc,i,'L',globalThis));
-    const saved={mon:{...target,moves,speed:adapter.effectiveSpeed(doc,'L').value},native:currentNative('L'),
-      damages:state.moves.map(m=>m.damageNotes?.[0]||{damage:m.damage?.[0]}),aiFingerprint:nativeFingerprint('R')};
+  function shortName(name){return String(name||'Empty slot').split(' (')[0];}
+  function slotLabel(slot){return slot==='enemyLeft'?'Enemy left':slot==='a'?'Your active Pokémon':slot==='b'?(tagBattle?'Your ally / Cheryl':'Your second Pokémon'):'Enemy right';}
+  function setMetadata(setId){
+    try{const direct=globalThis.getSetDataFromSetId?.(setId);if(direct)return direct;}catch{}
+    const m=String(setId||'').replace(/\[\d+\]\s*$/,'').match(/^(.*?) \((.*)\)$/);
+    return m?globalThis.setdex?.[m[1]]?.[m[2]]||null:null;
+  }
+  function presetCatalog(){
+    if(catalogCache&&catalogSource===globalThis.setdex)return catalogCache;
+    try{
+      const options=typeof globalThis.getSetOptions==='function'?globalThis.getSetOptions():
+        Object.entries(globalThis.setdex||{}).flatMap(([species,sets])=>Object.keys(sets).map(set=>({id:species+' ('+set+')',text:species+' ('+set+')'})));
+      catalogCache=options.filter(x=>x.id).map(x=>({id:x.id,text:x.text||x.id}));catalogSource=globalThis.setdex;
+      return catalogCache;
+    }catch{return [];}
+  }
+  function captureBoard(slot,redraw=true,sourceSide=null){
+    const snapshot=adapter.readBattle(doc,globalThis),state=snapshot.state;
+    const side=sourceSide||(slot==='ally'||slot==='enemyLeft'?'R':'L');
+    const target=side==='R'?{
+      ...adapter.fromSide(doc,side),types:adapter.readTypes(doc,side),
+      ability:adapter.readAbility(doc,side),status:adapter.readStatus(doc,side),
+      item:adapter.readItem(doc,side),level:state.level,gender:state.gender,
+      stages:adapter.readBoosts(doc,side),name:selectedSet('#p2')||'Enemy partner',
+      lastMoveCategory:adapter.readHistory(doc,side).lastMoveCategory,
+      safeguard:state.ownSafeguard,reflectActive:state.reflectActive,
+      lightScreenActive:state.lightScreenActive
+    }:state.targets[0];
+    if(!Number.isFinite(target?.hp)||!Number.isFinite(target?.maxHp)||!target.types?.length){boardMessage='The selected Pokémon is still loading. Try again once its HP is visible.';if(redraw)refreshView();return;}
+    const moves=Array.from({length:4},(_,i)=>adapter.moveMetadata(doc,i,side,globalThis));
+    const saved={mon:{...target,moves,speed:adapter.effectiveSpeed(doc,side).value},baseSpeed:adapter.readSpeed(doc,side),native:currentNative(side),setId:selectedSet(side==='R'?'#p2':'#p1'),
+      damages:slot==='ally'?[]:state.moves.map(m=>m.damageNotes?.[0]||{damage:m.damage?.[0]}),aiFingerprint:nativeFingerprint('R')};
+    saved.meta=setMetadata(saved.setId);
     saved.mon.possibleAbilities=adapter.possibleAbilities(globalThis,saved.mon,saved.native);
-    board()[slot]=saved;refreshView();
+    saved.mon.name=saved.setId||saved.mon.name;
+    board()[slot]=saved;boardMessage='';if(redraw)refreshView();return saved;
+  }
+  function recordFromSet(setId){
+      if(typeof globalThis.createPokemon!=='function')throw Error('Direct set loading is unavailable in this calculator. Use the panel buttons below.');
+      const native=globalThis.createPokemon(setId);
+      if(!native?.clone||!native.maxHP?.())throw Error('This set could not be loaded.');
+      const set=setMetadata(setId);
+      const moves=(native.moves||[]).map((m,i)=>{
+        const name=set?.moves?.[i]||m.name;
+        const d=globalThis.jsonMoves?.[name]||globalThis.backup_moves?.[name]||globalThis.moves?.[name]||{};
+        const meta={name,type:d.type||m.type,category:d.category||m.category,basePower:Number(d.basePower??d.bp??m.bp)||0,priority:Number(d.priority??m.priority)||0};
+        if(globalThis.calc?.Move){
+          native.moves[i]=new globalThis.calc.Move(globalThis.gen||4,m.name,{ability:native.ability,item:native.item,
+            overrides:{...d,basePower:meta.basePower,type:meta.type,category:meta.category,priority:meta.priority}});
+        }
+        return meta;
+      });
+      const maxHp=native.maxHP(),rawHp=Number(set?.currentHp??maxHp);
+      const hp=Number.isFinite(rawHp)?Math.max(0,Math.min(maxHp,rawHp)):maxHp;
+      const mon={name:setId,hp,maxHp,level:native.level,gender:native.gender,types:[...native.types],ability:native.ability,item:native.item,
+        status:({brn:'Burned',par:'Paralyzed',psn:'Poisoned',tox:'Badly poisoned',slp:'Asleep',frz:'Frozen'})[native.status]||'Healthy',speed:Number(native.stats?.spe),stages:{...native.boosts},moves,lastMoveCategory:'None'};
+      mon.possibleAbilities=adapter.possibleAbilities(globalThis,mon,native);
+      native.originalCurHP=hp;
+      return {mon,native,meta:set,baseSpeed:Number(native.rawStats?.spe??native.stats?.spe),setId,damages:[],aiFingerprint:null};
+  }
+  // Trainer ownership is independent of which calculator editor displays a set.
+  function trainerId(value){return value==null||value===false||value===''?null:String(value);}
+  function trainerLead(id){
+    return presetCatalog().filter(o=>trainerId(setMetadata(o.id)?.tr_id)===id)
+      .sort((a,b)=>(setMetadata(a.id)?.sub_index??999)-(setMetadata(b.id)?.sub_index??999))[0]?.id;
+  }
+  function seedTrainer(slot,id){
+    if(!id)return;
+    if(trainerId(board()[slot]?.meta?.tr_id)===id)return;
+    board()[slot]=null;
+    const lead=trainerLead(id);if(lead)try{board()[slot]=recordFromSet(lead);}catch{}
+  }
+  function routeSlot(setId){
+    const m=setMetadata(setId),id=trainerId(m?.tr_id);
+    if(m?.isCustomSet||/\(My Box\)(?:\[\d+\])?$/.test(setId))return 'a';
+    const ally=trainerId(globalThis.manualTagPartnerTrainerId)||trainerSlots.partner;
+    if(id&&id===ally)return 'b';
+    if(id&&id===trainerSlots.left)return 'enemyLeft';
+    if(id&&id===trainerSlots.right)return 'ally';
+    // Only explicit paired-trainer metadata can establish a new tag battle.
+    const other=trainerId(m?.partner),partner=trainerId(m?.tagPartner);
+    if(id&&other&&partner){
+      trainerSlots.left=id;trainerSlots.right=other;trainerSlots.partner=partner;
+      board().enemyLeft=null;board().ally=null;
+      seedTrainer('ally',other);seedTrainer('b',partner);
+      return 'enemyLeft';
+    }
+    return null;
+  }
+  function syncAutomaticBoard(state){
+    const right=setMetadata(selectedSet('#p2'));
+    if(!modeChosen&&right?.tagPartner&&right?.partner)tagBattle=true;
+    // Selecting an ally set can make native controls reset the format. Keep
+    // the already-bound tag battlefield until its layout is explicitly changed.
+    const paired=right?.tagPartner&&right?.partner||trainerSlots.left&&trainerSlots.right&&trainerSlots.partner;
+    if(automatic()&&paired&&state.format!=='Doubles'){
+      state.format='Doubles';
+      const doubles=doc.querySelector('input[name="format"][value="Doubles"]');
+      if(doubles&&!doubles.checked){
+        doc.querySelectorAll('input[name="format"]').forEach(e=>{e.checked=e===doubles;});
+        doubles.dispatchEvent(new Event('change',{bubbles:true}));
+      }
+    }
+    if(state.format!=='Doubles'){pendingSelections.length=0;return;}
+
+    if(!automatic()){pendingSelections.length=0;return;}
+    // Establish the pair before routing a first click on the ally preview.
+    if(!trainerSlots.left&&right?.partner&&right?.tagPartner)routeSlot(selectedSet('#p2'));
+    // Clicks also cover previews which do not change a calculator editor.
+    for(const id of pendingSelections.splice(0)){
+      const slot=routeSlot(id);
+      if(slot)try{board()[slot]=recordFromSet(id);lastSelection={id,slot};boardMessage='';}catch(e){boardMessage=e.message;}
+      else boardMessage='Trainer ownership is not available for '+id+'. Use a card’s manual controls.';
+    }
+    for(const side of ['R','L']){
+      const id=selectedSet(side==='R'?'#p2':'#p1'),fp=nativeFingerprint(side);
+      if(seenEditors.get(side)===fp)continue;
+      const slot=routeSlot(id);
+      if(!slot){seenEditors.set(side,fp);continue;}
+      const record=captureBoard(slot,false,side);
+      // Retry after loading if the native fields are not ready yet.
+      if(record){seenEditors.set(side,fp);if(lastSelection?.id===id)lastSelection.slot=slot;}
+    }
+    const ally=trainerId(globalThis.manualTagPartnerTrainerId);
+    if(ally&&ally!==trainerSlots.partner){trainerSlots.partner=ally;seedTrainer('b',ally);}
+  }
+  function primaryBoardState(original){
+    const r=automatic()&&original.format==='Doubles'?board().enemyLeft:null;
+    if(!r)return original;
+    return {...original,...r.mon,aiStatus:r.mon.status,
+      flags:r.meta?.ai!=null?adapter.decodeFlags(r.meta.ai):null,
+      moves:r.mon.moves.map(m=>({...m,damage:[],effectiveness:[],damageNotes:[]}))};
+  }
+  function loadPreset(slot,setId){
+    try{
+      board()[slot]=recordFromSet(setId);boardMessage='';refreshView();
+    }catch(e){boardMessage=e.message||'Could not load that set.';refreshView();}
+  }
+  function renderPresetPicker(card,slot,onChoose=null,labelOverride=null){
+    const details=create('details');details.appendChild(create('summary','Choose a saved set directly'));
+    const options=presetCatalog();
+    if(!options.length){details.appendChild(create('p','Saved sets become available once calculator data has loaded. You can also copy an edited Pokémon from the panel below.','pkai-help'));card.appendChild(details);return;}
+    const search=create('input');search.type='search';search.placeholder=slot==='b'&&tagBattle?'Search Chansey, Cheryl…':'Search species or trainer…';search.setAttribute('aria-label','Search sets for '+(labelOverride||slotLabel(slot)));
+    const select=create('select');select.setAttribute('aria-label','Saved set for '+(labelOverride||slotLabel(slot)));
+    const count=create('div',null,'pkai-help');
+    const fill=()=>{const terms=search.value.toLowerCase().trim().split(/\s+/).filter(Boolean);const matches=options.filter(o=>terms.every(t=>o.text.toLowerCase().includes(t)));
+      select.replaceChildren();const none=create('option','Select a Pokémon…');none.value='';select.appendChild(none);
+      for(const o of matches.slice(0,60)){const opt=create('option',o.text);opt.value=o.id;select.appendChild(opt);}
+      count.textContent=matches.length>60?'Showing 60 of '+matches.length+' sets. Narrow your search.':matches.length+' matching sets.';
+    };
+    search.addEventListener('input',fill);fill();
+    const use=create('button','Use selected set');use.type='button';use.disabled=true;use.id='pkai-preset-'+slot;
+    select.addEventListener('change',()=>{use.disabled=!select.value;});use.addEventListener('click',()=>onChoose?onChoose(select.value):loadPreset(slot,select.value));
+    details.append(search,select,count,use);card.appendChild(details);
+  }
+  function canonicalSet(id){return String(id||'').replace(/\[\d+\]\s*$/,'').trim();}
+  function trainerCaption(record,slot){
+    if(slot==='a')return 'You · My Box';
+    try{const name=globalThis.getTagPartnerTrainerName?.(record?.meta?.tr_id);if(name)return name;}catch{}
+    return String(record?.setId||'').match(/\((.*)\)/)?.[1]?.replace(/^Lvl\s+\d+\s+/,'')||'Trainer not identified';
+  }
+  function pokemonSprite(record){
+    const img=create('img');img.className='pkai-slot-sprite';img.alt=shortName(record.mon.name);
+    const native=[...doc.querySelectorAll('img.trainer-pok[data-id]')].find(e=>canonicalSet(e.dataset.id)===canonicalSet(record.setId));
+    if(native?.getAttribute('src'))img.src=native.getAttribute('src');
+    else{
+      let name=shortName(record.mon.name);
+      try{name=globalThis.getPreviewSpriteName?.(name)||name.toLowerCase().replace(/ /g,'-').replace(/[.’]/g,'');}catch{}
+      const style=globalThis.sprite_style||doc.querySelector('img.trainer-pok[src]')?.getAttribute('src')?.match(/img\/([^/]+)\//)?.[1]||'pokesprite';
+      img.src='./img/'+style+'/'+name+'.png';
+    }
+    return img;
+  }
+  function clearSpriteFeedback(){
+    for(const [img,old]of markedSprites){
+      delete img.dataset.pkaiSlot;delete img.dataset.pkaiLastClick;
+      for(const [attr,value]of Object.entries(old))if(value==null)img.removeAttribute(attr);else img.setAttribute(attr,value);
+    }
+    markedSprites.clear();for(const strip of selectionStrips.values())strip.remove();selectionStrips.clear();
+  }
+  function renderSpriteFeedback(state){
+    clearSpriteFeedback();
+    const records={enemyLeft:automatic()?board().enemyLeft:liveEnemyRecord(state),ally:board().ally,a:board().a,b:board().b};
+    for(const img of doc.querySelectorAll('img.trainer-pok[data-id]')){
+      const slot=Object.keys(records).find(k=>records[k]&&canonicalSet(records[k].setId)===canonicalSet(img.dataset.id));
+      if(!slot)continue;
+      markedSprites.set(img,{title:img.getAttribute('title'),'aria-current':img.getAttribute('aria-current')});
+      img.dataset.pkaiSlot=slot;img.setAttribute('aria-current','true');
+      img.title=slotLabel(slot)+': '+shortName(records[slot].mon.name);
+      if(lastSelection?.slot===slot&&canonicalSet(lastSelection.id)===canonicalSet(img.dataset.id))img.dataset.pkaiLastClick='true';
+    }
+    const lists=doc.querySelectorAll('.player-poks,.player-party,.tag-partner-preview,.trainer-pok-list.opposing,.mobile-box-shortcut-poks,.mobile-box-shortcut-party');
+    for(const list of lists){
+      if(!list.querySelector('img.trainer-pok[data-id]'))continue;
+      const strip=create('div',null,'pkai-selection-strip');strip.setAttribute('aria-label','Current doubles battlefield');
+      const status=create('div',lastSelection?'Selected '+shortName(lastSelection.id)+' → '+slotLabel(lastSelection.slot):'Doubles / tag battlefield');
+      status.setAttribute('role','status');status.setAttribute('aria-live','polite');strip.appendChild(status);
+      const grid=create('div',null,'pkai-mini-grid');
+      for(const slot of ['enemyLeft','ally','a','b']){
+        const r=records[slot],button=create('button');button.type='button';button.dataset.slot=slot;
+        button.setAttribute('aria-label','Show '+slotLabel(slot)+' battlefield card');
+        if(lastSelection?.slot===slot)button.dataset.lastSelected='true';
+        button.appendChild(create('span',slotLabel(slot)));
+        if(r)button.append(pokemonSprite(r),create('strong',shortName(r.mon.name)));else button.appendChild(create('span','Not selected'));
+        button.addEventListener('click',()=>{const card=boardDock.querySelector('[data-slot="'+slot+'"]')||boardDock;card.scrollIntoView?.({behavior:'smooth',block:'center'});card.tabIndex=-1;card.focus({preventScroll:true});});
+        grid.appendChild(button);
+      }
+      strip.appendChild(grid);list.before(strip);selectionStrips.set(list,strip);
+    }
   }
   function renderBoard(state){
-    if(state.format!=='Doubles')return;
-    const fs=create('fieldset');fs.appendChild(create('legend','Doubles: two opponents + AI partner'));
-    fs.appendChild(create('div','Keep the AI Pokémon in the right panel. Select each other Pokémon in the left panel, then save it below. Saved slots stay in this session. To update a set, select it again and save that slot.','pkai-help'));
+    boardDock.replaceChildren();boardDock.hidden=state.format!=='Doubles';
+    if(state.format!=='Doubles'){clearSpriteFeedback();return;}
+    const fs=create('fieldset');fs.id='pkai-battlefield';fs.appendChild(create('legend','Doubles battlefield'));
+    const mode=create('select');mode.id='pkai-battle-mode';mode.setAttribute('aria-label','Doubles battle layout');
+    for(const [value,label]of [['doubles','Doubles — you control both Pokémon'],['tag','Tag battle — you + an AI ally (Cheryl)']]){const o=create('option',label);o.value=value;mode.appendChild(o);}mode.value=tagBattle?'tag':'doubles';
+    mode.addEventListener('change',()=>{tagBattle=mode.value==='tag';modeChosen=true;seenEditors.clear();refreshView();});fs.appendChild(mode);
+    const turnLine=create('label',null,'pkai-line');turnLine.appendChild(create('span','Battle turn'));
+    const turn=create('input');turn.type='number';turn.min='1';turn.id='pkai-battle-turn';turn.value=battleTurn==null?'':String(battleTurn);turn.placeholder='Unknown';turn.style.width='80px';turn.setAttribute('aria-label','Battle turn for all AI predictions');
+    turn.addEventListener('change',()=>{battleTurn=Number.isInteger(Number(turn.value))&&Number(turn.value)>0?Number(turn.value):null;refreshView();});turnLine.appendChild(turn);fs.appendChild(turnLine);
+    if(tagBattle){
+      const label=create('label',null,'pkai-line'),toggle=create('input');toggle.type='checkbox';toggle.id='pkai-auto-slots';toggle.checked=autoAssign;
+      toggle.addEventListener('change',()=>{autoAssign=toggle.checked;seenEditors.clear();refreshView();});label.append(toggle,create('span','Assign clicked Pokémon by trainer'));fs.appendChild(label);
+    }
+    fs.appendChild(create('div',automatic()?'Click a Pokémon in either editor, a trainer team, your box, or the ally preview. Its trainer determines its slot. The first enemy selected owns Enemy left; its paired trainer owns Enemy right. Other slots stay in place. Unselected trainers start with their first listed Pokémon at preset HP; click their current Pokémon after a switch.':'RIGHT panel = Enemy left. Use the cards below to select the other positions.','pkai-help'));
     const saved=board();
-    for(const [slot,label] of [['a','Opponent A'],['b','Opponent B'],['ally','AI partner']]){
-      const row=create('div',null,'pkai-line');const save=create('button','Save left Pokémon as '+label);save.type='button';save.id='pkai-save-'+slot;
-      save.addEventListener('click',()=>captureBoard(slot));row.appendChild(save);
-      const record=saved[slot];row.appendChild(create('span',record?record.mon.name:'Not saved'));
+    const missing=(automatic()?['enemyLeft','a','b','ally']:['a','b','ally']).filter(s=>!saved[s]);
+    fs.appendChild(create('div',missing.length?'Finish setup: '+missing.map(slotLabel).join(' · '):'All four positions are filled. Predicting '+shortName(state.name||selectedSet('#p2'))+'.','pkai-ready'));
+    const grid=create('div',null,'pkai-battle-grid');
+    if(!automatic()){
+    const active=create('article',null,'pkai-slot');active.dataset.team='enemy';active.dataset.slot='active';active.append(create('h4','Enemy left · RIGHT editor'),create('div',shortName(state.name||selectedSet('#p2')),'pkai-slot-name'),create('div','HP '+(state.hp??'?')+' / '+(state.maxHp??'?')+' · '+(state.aiStatus||'Healthy'),'pkai-help'),create('div','Live from the RIGHT editor. The other enemy is set in Enemy right. Both enemies and the AI partner are predicted below.','pkai-help'));
+    const edit=create('button','Edit RIGHT enemy');edit.type='button';edit.addEventListener('click',()=>{const selector=doc.querySelector('#p2 .set-selector');selector?.scrollIntoView?.({block:'center',behavior:'smooth'});selector?.focus();});active.appendChild(edit);grid.appendChild(active);
+    }
+    for(const slot of (automatic()?['enemyLeft','ally','a','b']:['ally','a','b'])){
+      const label=slotLabel(slot),record=saved[slot],row=create('article',null,'pkai-slot');row.dataset.team=slot==='ally'||slot==='enemyLeft'?'enemy':'friendly';row.dataset.slot=slot;
+      row.appendChild(create('h4',label));
+      if(record){row.appendChild(pokemonSprite(record));row.appendChild(create('div',trainerCaption(record,slot),'pkai-help'));}
+      if(lastSelection?.slot===slot)row.dataset.lastSelected='true';
+      row.appendChild(create('div',record?shortName(record.mon.name):'Choose a Pokémon','pkai-slot-name'));
+      if(record)row.appendChild(create('div',record.mon.name,'pkai-help'));
       if(record){
         const hp=create('input');hp.type='number';hp.min='0';hp.max=String(record.mon.maxHp);hp.value=String(record.mon.hp);hp.style.width='68px';hp.setAttribute('aria-label',label+' current HP');
         hp.addEventListener('change',()=>{const n=Number(hp.value);if(Number.isInteger(n)&&n>=0&&n<=record.mon.maxHp){record.mon.hp=n;refreshView();}});
         row.append(create('span','HP'),hp,create('span','/ '+record.mon.maxHp));
-        const clear=create('button','Clear');clear.type='button';clear.addEventListener('click',()=>{saved[slot]=null;refreshView();});row.appendChild(clear);
+        const status=create('select');status.setAttribute('aria-label',label+' status');
+        const statuses={Healthy:'',Burned:'brn',Paralyzed:'par',Poisoned:'psn','Badly poisoned':'tox',Asleep:'slp',Frozen:'frz'};
+        for(const [label,value]of Object.entries(statuses)){const o=create('option',label);o.value=value;status.appendChild(o);}
+        const nativeStatus=statuses[record.mon.status]??record.mon.status;
+        status.value=Object.values(statuses).includes(nativeStatus)?nativeStatus:'';
+        status.addEventListener('change',()=>{record.mon.status=Object.keys(statuses).find(k=>statuses[k]===status.value)||'Healthy';if(record.native)record.native.status=status.value;refreshView();});row.appendChild(status);
+        const faint=create('button',record.mon.hp===0?'Restore full HP':'Mark fainted');faint.type='button';faint.setAttribute('aria-label',(record.mon.hp===0?'Restore ':'Mark fainted: ')+label);
+        faint.addEventListener('click',()=>{record.mon.hp=record.mon.hp===0?record.mon.maxHp:0;refreshView();});row.appendChild(faint);
+        row.appendChild(create('div',(record.mon.hp===0?'Fainted · ':record.mon.types.join(' / ')+' · ')+record.mon.ability+' · '+(record.mon.status||'Healthy'),'pkai-help'));
+        if(slot!=='a'){const clear=create('button','Remove');clear.type='button';clear.setAttribute('aria-label','Remove '+label);clear.addEventListener('click',()=>{saved[slot]=null;refreshView();});row.appendChild(clear);}
       }
-      fs.appendChild(row);
+      const manual=create('details');manual.appendChild(create('summary','Manual slot controls'));
+      renderPresetPicker(manual,slot);
+      const source=slot==='ally'||slot==='enemyLeft'?'RIGHT':'LEFT';
+      const copy=create('button','Copy '+source+': '+shortName(selectedSet(source==='RIGHT'?'#p2':'#p1')));copy.type='button';copy.id='pkai-save-'+slot;
+      copy.setAttribute('aria-label','Copy '+source+' Pokémon into '+label);copy.addEventListener('click',()=>captureBoard(slot));manual.appendChild(copy);row.appendChild(manual);
+      if(slot==='ally'&&!automatic())row.appendChild(create('div','Copy RIGHT is for an edited set. After copying, select the enemy being predicted in the RIGHT panel again.','pkai-help'));
+      grid.appendChild(row);
     }
-    panel.appendChild(fs);
+    fs.appendChild(grid);
+    const refreshSets=create('button','Refresh saved-set list');refreshSets.type='button';refreshSets.addEventListener('click',()=>{catalogCache=null;partyIndexCache.clear();partyCache.clear();refreshView();});fs.appendChild(refreshSets);
+    fs.appendChild(create('div',automatic()?'Editor changes update the matching trainer’s card automatically. You can also change HP and status directly on a card.':'After a switch or edit, update the matching card with its Copy button.','pkai-help'));
+    if(boardMessage){const message=create('p',boardMessage,'pkai-setup-error');message.setAttribute('role','alert');fs.appendChild(message);}
+    fs.appendChild(create('div','The three prediction cards use the same current battlefield. Choices are made before moves resolve; this is not a turn simulator. An enemy’s “partner” is the other enemy, while Cheryl’s partner is your active Pokémon.','pkai-help'));
+    boardDock.appendChild(fs);
+    renderSpriteFeedback(state);
   }
   function applyBoardAndDamage(original){
     const state={...original,moves:original.moves.map(m=>({...m,damage:[...m.damage],effectiveness:[...m.effectiveness],damageNotes:[...(m.damageNotes||[])]})),targets:original.targets.map(t=>({...t}))};
     const notes=[],blockers=[];const saved=board(),isDouble=state.format==='Doubles';
     let records=[null];
     if(isDouble){
-      if(!saved.a||!saved.b)blockers.push('Save both Opponent A and Opponent B using the left Pokémon selector');
-      if(!saved.ally)blockers.push('Save the AI partner (set its HP to 0 if fainted)');
+      if(!saved.a&&!automatic())captureBoard('a',false);
+      for(const slot of ['a','b','ally','enemyLeft']){
+        const r=saved[slot];if(!r)continue;
+        r.mon.speed=adapter.speedFromState({base:r.baseSpeed,stage:r.mon.stages?.spe??0,rawStatus:r.mon.status,
+          ability:r.mon.ability,item:r.mon.item,weather:adapter.readWeather(doc),
+          tailwind:adapter.readBoolean(doc,['#tailwind'+(slot==='ally'||slot==='enemyLeft'?'R':'L')])}).value;
+      }
+      if(!saved.a||!saved.b)blockers.push('Choose '+(!saved.a?slotLabel('a'):slotLabel('b'))+' in the battlefield below');
+      if(!saved.ally)blockers.push('Choose the other enemy in the battlefield below; mark it fainted if no longer active');
       records=[saved.a,saved.b];
       state.targets=records.map((r,i)=>r?{...r.mon}:original.targets[i]||{hp:null,maxHp:null,types:[],name:'Opponent '+(i?'B':'A')});
       state.ally=saved.ally?{...saved.ally.mon}:null;
@@ -3023,7 +3472,9 @@
       state.allyTypes=state.ally?.types;state.allyAbility=state.ally?.ability;state.allyMoves=state.ally?.moves;
       state.allyMagnetRise=state.ally?.magnetRise;
     }
-    const attacker=currentNative('R'),field=scoringField(),speed=adapter.effectiveSpeed(doc,'R').value;
+    const actor=automatic()&&isDouble?saved.enemyLeft:null;
+    if(automatic()&&isDouble&&!actor)blockers.push('Select an enemy with paired trainer data, or turn off automatic assignment');
+    const attacker=actor?.native||currentNative('R'),field=scoringField(),speed=actor?.mon.speed??adapter.effectiveSpeed(doc,'R').value;
     state.speed=speed;
     if(state.ally&&Number.isFinite(speed)&&Number.isFinite(state.ally.speed)){
       state.userSlowerThanAlly=speed<state.ally.speed;state.speedTieWithAlly=speed===state.ally.speed;
@@ -3036,6 +3487,7 @@
       if(isDouble)for(const key of ['safeguard','reflectActive','lightScreenActive','stealthRockActive','spikesLayers','toxicSpikesLayers'])if(original.targets[0]?.[key]!=null)foe[key]=original.targets[0][key];
       if(!foe.maxHp)continue;
       const foeSpeed=record?record.mon.speed:adapter.effectiveSpeed(doc,'L').value;
+      foe.speed=foeSpeed;
       if(Number.isFinite(speed)&&Number.isFinite(foeSpeed)){
         foe.userSlower=speed===foeSpeed?null:speed<foeSpeed;foe.speedTie=speed===foeSpeed;
       }
@@ -3048,7 +3500,7 @@
         let detail=native;
         if(!detail){
           const raw=record?.damages?.[i]||(!isDouble?original.moves[i].damageNotes?.[0]:null);
-          if(record&&record.aiFingerprint!==fp){m.damage[t]=null;notes.push('AI set changed; re-save '+(t?'Opponent B':'Opponent A')+' to refresh its damage');continue;}
+          if(record&&record.aiFingerprint!==fp){m.damage[t]=null;notes.push('Damage must be refreshed for '+slotLabel(t?'b':'a')+'; copy the edited set again or use a saved set with native calculation');continue;}
           detail=raw?adapter.approximateDamage(raw,state,m,foe):null;
         }
         if(detail){m.damage[t]=detail.damage??detail.estimatedDamage??null;m.damageNotes[t]=detail;if(detail.distribution){if(!m.damageDistributions)m.damageDistributions=[];m.damageDistributions[t]=detail.distribution;}}
@@ -3070,6 +3522,252 @@
     }
     return {state,notes:[...new Set(notes)],blockers};
   }
+  // All three AI views share the four saved battlefield records, but never a
+  // trainer's flags, party, screens, history, or target orientation.
+  function actorLabel(role){return role==='partner'?'Partner AI / Cheryl':role==='enemyLeft'?'Enemy left AI':'Enemy right AI';}
+  function settingsFor(role,record){
+    const id=role+'|'+(record?.setId||record?.mon.name||'empty');
+    if(!actorSettings.has(id))actorSettings.set(id,{context:{},history:{},disabled:new Set(),manualParty:null,partyConfirmed:null,aiMask:null});
+    return actorSettings.get(id);
+  }
+  function updateRecordSpeed(record,side){
+    if(!record)return;
+    record.mon.speed=adapter.speedFromState({base:record.baseSpeed,stage:record.mon.stages?.spe??0,
+      rawStatus:record.mon.status||'Healthy',ability:record.mon.ability,item:record.mon.item,
+      weather:adapter.readWeather(doc),tailwind:adapter.readBoolean(doc,['#tailwind'+side])}).value;
+  }
+  function liveEnemyRecord(state){
+    return {setId:selectedSet('#p2'),meta:setMetadata(selectedSet('#p2')),native:currentNative('R'),baseSpeed:adapter.readSpeed(doc,'R'),
+      mon:{...state,name:selectedSet('#p2')||state.name||'Enemy left',status:state.aiStatus||'Healthy',moves:state.moves.map(m=>({...m})),speed:state.speed}};
+  }
+  function rosterFor(record,friend,prefs){
+    let ids=prefs.manualParty,source='Manual party',known=prefs.partyConfirmed===true,errors=[];
+    if(ids==null){
+      const trainer=record?.meta?.tr_id;
+      if(trainer!=null){
+        source='Trainer '+trainer+' from calculator data';known=true;
+        if(!partyIndexCache.has(trainer))partyIndexCache.set(trainer,presetCatalog().filter(o=>setMetadata(o.id)?.tr_id===trainer).sort((a,b)=>(setMetadata(a.id)?.sub_index??0)-(setMetadata(b.id)?.sub_index??0)).map(o=>o.id));
+        ids=partyIndexCache.get(trainer);
+      }else{ids=[];known=false;source='Trainer party not detected';}
+    }
+    if(prefs.partyConfirmed!=null)known=prefs.partyConfirmed;
+    const same=(id,r)=>String(id).replace(/\[\d+\]\s*$/,'')===String(r?.setId||'').replace(/\[\d+\]\s*$/,'')||
+      (r?.meta?.sub_index!=null&&setMetadata(id)?.tr_id===r.meta.tr_id&&setMetadata(id)?.sub_index===r.meta.sub_index);
+    const party=[];
+    for(const id of [...new Set(ids)]){
+      if(same(id,record)||same(id,friend))continue;
+      try{
+        if(!partyCache.has(id))partyCache.set(id,recordFromSet(id));
+        const r=partyCache.get(id),edit=reserveEdits.get(id)||{};
+        const mon={...r.mon,...edit,id,moves:r.mon.moves.map(m=>({...m})),stages:{...r.mon.stages}};
+        party.push({record:r,mon});
+      }catch(e){errors.push('Could not load reserve '+id);known=false;}
+    }
+    return {party,known,source,errors};
+  }
+  function phase2SwitchScore(active,move,target,field,records){
+    const a=active.native?.clone?.(),d=records.get(target.id)?.native?.clone?.();
+    if(!a||!d||!globalThis.calc?.calculate)return null;
+    const saved=globalThis.calcingForSwitchIns;
+    try{
+      a.boosts={};a.originalCurHP=1;
+      const meta=globalThis.jsonMoves?.[move.name]||globalThis.backup_moves?.[move.name]||globalThis.moves?.[move.name]||{};
+      const name=typeof globalThis.normalizeMoveNameForCalc==='function'?globalThis.normalizeMoveNameForCalc(move.name):move.name;
+      const m=new globalThis.calc.Move(globalThis.gen||4,name,{ability:a.ability,item:a.item,
+        overrides:{...meta,basePower:move.basePower,type:move.type,category:move.category,priority:move.priority||0}});
+      m.hits=1;globalThis.calcingForSwitchIns=true;
+      const r=globalThis.calc.calculate(globalThis.gen||4,a,d,m,field.clone?.()||field);
+      if(typeof globalThis.getGen4Phase2DamageScore==='function')return globalThis.getGen4Phase2DamageScore(r);
+      const fallback=globalThis.PKAISwitch.phase2ScoreFromResult(r);if(fallback!=null)return fallback;
+      if(typeof r.damage==='number')return r.damage&255;
+      if(m.category==='Status')return 0;
+      return null;
+    }catch{return null;}finally{globalThis.calcingForSwitchIns=saved;}
+  }
+  function buildActorPrediction(role,record,friend,foes,common,boardRecords){
+    const prefs=settingsFor(role,record),errors=[],notes=[];
+    if(!record||!friend||foes.some(r=>!r))return {role,record,prefs,errors:['Fill all four battlefield positions first.']};
+    const ownLeft=role==='partner',field=ownLeft?globalThis.createField?.():scoringField();
+    const roster=rosterFor(record,friend,prefs);
+    const actor={...record.mon,id:role,stages:{...record.mon.stages},moves:record.mon.moves.map(m=>({...m}))};
+    const mask=prefs.aiMask??(role==='enemyLeft'?null:record.meta?.ai);
+    let flags=prefs.aiMask!=null?adapter.decodeFlags(prefs.aiMask):role==='enemyLeft'?common.flags:mask!=null?adapter.decodeFlags(mask):null;
+    if(flags)flags={...flags,doubles:true};
+    if(!flags)errors.push('Trainer AI flags are unknown. Set this actor’s numeric AI mask below.');
+    const fieldInfo=adapter.readFieldState(doc),own=ownLeft?fieldInfo.foe:fieldInfo.own,other=ownLeft?fieldInfo.own:fieldInfo.foe;
+    const targets=foes.map((r,i)=>{
+      const id=ownLeft?(i?'enemyRight':'enemyLeft'):(i?'partner':'player');
+      const oppositeRoster=id==='player'?null:rosterFor(r,foes[1-i],settingsFor(id,r));
+      return {...r.mon,id,stages:{...r.mon.stages},
+      ...(role==='enemyLeft'?common.targets[i]:{}),safeguard:other.safeguard,reflectActive:other.reflect,lightScreenActive:other.lightScreen,
+      hasReserves:oppositeRoster?.known?oppositeRoster.party.some(p=>p.mon.hp>0):r.mon.hasReserves,
+      userSlower:actor.speed===r.mon.speed?null:Number.isFinite(actor.speed)&&Number.isFinite(r.mon.speed)?actor.speed<r.mon.speed:null,
+      speedTie:Number.isFinite(actor.speed)&&actor.speed===r.mon.speed,
+      allySlower:Number.isFinite(friend.mon.speed)&&Number.isFinite(r.mon.speed)?friend.mon.speed===r.mon.speed?null:friend.mon.speed<r.mon.speed:null};});
+    const state={...(role==='enemyLeft'?common:{}),...actor,aiStatus:actor.status||'Healthy',flags,format:'Doubles',weather:common.weather,
+      firstTurn:battleTurn!=null?battleTurn===1:common.firstTurn,firstTurnOut:prefs.firstTurnOut??(role==='enemyLeft'?common.firstTurnOut:null),
+      partyHasReserve:roster.known?roster.party.some(r=>r.mon.hp>0):null,
+      trickRoom:common.trickRoom,gravity:common.gravity,reflectActive:own.reflect,lightScreenActive:own.lightScreen,ownSafeguard:own.safeguard,
+      tailwindActive:own.tailwind,targets,ally:{...friend.mon,abilityKnown:true},allyAlive:friend.mon.hp>0,
+      allyTypes:friend.mon.types,allyAbility:friend.mon.ability,allyMoves:friend.mon.moves,allyMagnetRise:friend.mon.magnetRise};
+    state.userSlowerThanAlly=Number.isFinite(actor.speed)&&Number.isFinite(friend.mon.speed)?actor.speed<friend.mon.speed:null;
+    state.ally.movesBeforeBothFoes=targets.every(t=>t.allySlower===false)?true:targets.some(t=>t.allySlower===true)?false:null;
+    for(let i=0;i<state.moves.length;i++){
+      const m=state.moves[i];m.effectiveness=targets.map(t=>adapter.aiEffectiveness(state,m,t));
+      m.damageDistributions=role==='enemyLeft'?[...(common.moves[i]?.damageDistributions||[])]:[];
+      m.damage=targets.map((t,j)=>{
+        if(m.category==='Status')return 0;
+        const detail=adapter.nativeAIDamage(globalThis,state,m,t,record.native,foes[j].native,field,i);
+        if(detail?.distribution)m.damageDistributions[j]=detail.distribution;
+        return detail?.damage??(role==='enemyLeft'?common.moves[i]?.damage[j]:null);
+      });
+      m.usable=!prefs.disabled.has(i)&&m.usable!==false;
+    }
+    state.allyMoveDamages=targets.map((t,j)=>friend.mon.moves.map((m,i)=>m.category==='Status'?0:
+      adapter.nativeAIDamage(globalThis,{...state,...friend.mon,aiStatus:friend.mon.status},m,t,friend.native,foes[j].native,field,i)?.damage??null));
+    if(state.allyMoveDamages.some(ds=>ds.some(d=>d==null))){notes.push('Some teammate damage could not be read.');state.allyMoveDamages=state.allyMoveDamages.map(ds=>ds.filter(d=>d!=null));}
+    const applicable=context.descriptorsFor(state),applied=context.apply(state,prefs.context);
+    const approximated=approximateContext(applied,applicable,prefs.context),prepared=prepareScoringState(approximated.state);
+    if(actor.hp>0)errors.push(...prepared.blockers);
+    if(!approximationEnabled&&applicable.some(s=>prefs.context[s.id]==null))errors.push('Set missing actor conditions or enable approximation.');
+    let result=null;
+    if(actor.hp>0&&!errors.length){try{result=engine.calculate(prepared.state);}catch(e){errors.push(e.message);}}
+    const history={...prefs.history};
+    if(/^(none|no previous hit)$/i.test(history.lastMoveName||''))history.lastMove='None';
+    else if(history.lastMoveName){
+      const n=[...new Set([...Object.keys(globalThis.jsonMoves||{}),...Object.keys(globalThis.backup_moves||{}),...Object.keys(globalThis.moves||{})])].find(n=>key(n)===key(history.lastMoveName));
+      const d=globalThis.jsonMoves?.[n]||globalThis.backup_moves?.[n]||globalThis.moves?.[n];
+      if(d)history.lastMove={name:n,type:d.type,category:d.category,basePower:Number(d.basePower??d.bp)||0};
+      else notes.push('Last-hit move is not recognized; switching remains unknown.');
+    }
+    if(history.sourceId)history.source=boardRecords.get(history.sourceId)?.mon;
+    if(battleTurn===1&&history.lastMove==null){history.lastMove='None';notes.push('Turn 1: no previous hit.');}
+    if(approximationEnabled){
+      if(history.lastMove==null&&!history.lastMoveName){history.lastMove='None';notes.push('Switch history assumes no previous hit.');}
+      for(const f of ['trapped','ingrain'])if(history[f]==null)history[f]=false;
+      if(history.perishTurns==null)history.perishTurns=-1;
+    }
+    const switchContext={actor,ally:friend.mon,targets,party:roster.party.map(r=>r.mon),partyKnown:roster.known,history,
+      format:'Doubles',gravity:common.gravity,onAssumption:n=>{if(!notes.includes(n))notes.push(n);},ineffectiveTargets:ownLeft?[boardRecords.get('player').mon,actor]:targets,
+      phase2Score:(a,m,t)=>phase2SwitchScore(record,m,t,field,boardRecords)};
+    let switching;
+    try{switching=globalThis.PKAISwitch.predict(switchContext);}catch(e){switching={known:false,switchProbability:null,stayProbability:null,choices:[],missing:[e.message],notes:[]};}
+    if(roster.known&&roster.party.length)notes.push('Unedited reserves are assumed alive at their preset HP. Mark used or fainted reserves below.');
+    return {role,record,prefs,roster,state:prepared.state,result,switching,switchContext,controls:applicable,errors,notes,
+      assumptions:approximated.assumptions,flagsSource:mask!=null?'Trainer mask '+mask:role==='enemyLeft'?'RIGHT editor flags':'Unknown flags'};
+  }
+  function allActorPredictions(common){
+    const left=automatic()?board().enemyLeft:liveEnemyRecord(common),own=board().a,partner=board().b,right=board().ally;
+    const records=new Map([['player',own],['partner',partner],['enemyLeft',left],['enemyRight',right]]);
+    for(const [id,r]of records)if(r){r.mon.id=id;updateRecordSpeed(r,id.startsWith('enemy')?'R':'L');
+      reserveEdits.set(r.setId,{hp:r.mon.hp,status:r.mon.status});}
+    const build=(role,r,friend,foes)=>{try{return buildActorPrediction(role,r,friend,foes,common,records);}catch(e){return {role,record:r,prefs:settingsFor(role,r),errors:['Prediction failed: '+e.message]};}};
+    const predictions=[build('partner',partner,own,[left,right]),build('enemyLeft',left,right,[own,partner]),build('enemyRight',right,left,[own,partner])];
+    // A shared trainer party reserves a selected replacement before the next
+    // battler's command is chosen. Mix the second enemy's switch distribution
+    // across the first enemy's reservations instead of offering an illegal
+    // simultaneous switch into the same party slot.
+    const l=predictions[1],r=predictions[2];
+    if(left?.meta?.tr_id!=null&&left.meta.tr_id===right?.meta?.tr_id&&l.switching?.known&&r.switching?.known&&l.switching.choices.every(c=>c.id!=='unknown')){
+      const outcomes=[{probability:l.switching.stayProbability,id:null},...l.switching.choices];
+      const mixed=new Map();let stay=0,known=true;
+      for(const outcome of outcomes){if(!outcome.probability)continue;
+        const s=globalThis.PKAISwitch.predict({...r.switchContext,party:r.switchContext.party.filter(p=>p.id!==outcome.id)});
+        if(!s.known){known=false;break;}stay+=outcome.probability*s.stayProbability;
+        for(const x of s.choices){const old=mixed.get(x.id)||{...x,probability:0};old.probability+=outcome.probability*x.probability;mixed.set(x.id,old);}
+      }
+      if(known){r.switching={...r.switching,choices:[...mixed.values()],stayProbability:stay,switchProbability:1-stay};r.notes.push('Switch destinations account for the left enemy reserving a shared-party slot first.');}
+    }
+    return predictions;
+  }
+  function renderActorInputs(host,p){
+    if(!p.record)return;
+    const details=create('details');details.appendChild(create('summary','Party, switch history & AI settings'));
+    const prefs=p.prefs,role=p.role;
+    const mask=create('input');mask.type='number';mask.min='0';mask.max='2047';mask.value=String(prefs.aiMask??p.record.meta?.ai??'');mask.placeholder='Unknown';mask.style.width='90px';mask.setAttribute('aria-label',actorLabel(role)+' AI flag mask');
+    mask.addEventListener('change',()=>{const n=Number(mask.value);prefs.aiMask=mask.value!==''&&Number.isInteger(n)&&n>=0&&n<=2047?n:null;refreshView();});
+    const row=create('label',null,'pkai-line');row.append(create('span','Trainer AI mask'),mask);details.appendChild(row);
+    const first=create('select');first.setAttribute('aria-label',actorLabel(role)+' first turn out');
+    for(const [value,text]of [['','Unknown'],['false','No'],['true','Yes']]){const o=create('option',text);o.value=value;first.appendChild(o);}first.value=prefs.firstTurnOut==null?'':String(prefs.firstTurnOut);
+    first.addEventListener('change',()=>{prefs.firstTurnOut=first.value===''?null:first.value==='true';refreshView();});const firstLine=create('label',null,'pkai-line');firstLine.append(create('span','This Pokémon’s first turn out'),first);details.appendChild(firstLine);
+    const h=prefs.history;
+    const input=create('input');input.type='text';input.value=h.lastMoveName||'';input.placeholder='Unknown — e.g. Thunderbolt';input.setAttribute('aria-label',actorLabel(role)+' last move that hit it');
+    input.addEventListener('change',()=>{h.lastMoveName=input.value.trim()||null;refreshView();});
+    const hit=create('label',null,'pkai-line');hit.append(create('span','Last move that hit it'),input);
+    const none=create('button','No previous hit');none.type='button';none.addEventListener('click',()=>{h.lastMoveName='None';h.sourceId=null;refreshView();});hit.appendChild(none);details.appendChild(hit);
+    const source=create('select');source.setAttribute('aria-label',actorLabel(role)+' last attacker');
+    for(const [id,label]of [['','Unknown attacker'],['player',slotLabel('a')],['partner','Partner / Cheryl'],['enemyLeft','Enemy left'],['enemyRight','Enemy right']]){const o=create('option',label);o.value=id;source.appendChild(o);}source.value=h.sourceId||'';
+    source.addEventListener('change',()=>{h.sourceId=source.value||null;refreshView();});details.appendChild(source);
+    for(const [field,label]of [['trapped','Trapped / bound'],['ingrain','Ingrain active']]){
+      const select=create('select');select.setAttribute('aria-label',actorLabel(role)+' '+label);
+      for(const [value,text]of [['','Unknown'],['false','No'],['true','Yes']]){const o=create('option',text);o.value=value;select.appendChild(o);}select.value=h[field]==null?'':String(h[field]);
+      select.addEventListener('change',()=>{h[field]=select.value===''?null:select.value==='true';refreshView();});const line=create('label',null,'pkai-line');line.append(create('span',label),select);details.appendChild(line);
+    }
+    const perish=create('select');perish.setAttribute('aria-label',actorLabel(role)+' Perish Song counter');
+    for(const [value,text]of [['','Unknown'],['-1','Not active'],['3','3'],['2','2'],['1','1 — faints at turn end'],['0','0 — already zero']]){const o=create('option',text);o.value=value;perish.appendChild(o);}perish.value=h.perishTurns==null?'':String(h.perishTurns);
+    perish.addEventListener('change',()=>{h.perishTurns=perish.value===''?null:Number(perish.value);refreshView();});const pr=create('label',null,'pkai-line');pr.append(create('span','Perish Song counter'),perish);details.appendChild(pr);
+    const roster=p.roster;
+    if(roster){
+      details.appendChild(create('p',roster.source+' · '+roster.party.filter(r=>r.mon.hp>0).length+' living reserves','pkai-help'));
+      for(const r of roster.party){
+        const line=create('label',null,'pkai-line');line.appendChild(create('span',shortName(r.mon.name)));
+        const hp=create('input');hp.type='number';hp.min='0';hp.max=String(r.mon.maxHp);hp.value=String(r.mon.hp);hp.style.width='70px';hp.setAttribute('aria-label',actorLabel(role)+' reserve '+shortName(r.mon.name)+' HP');
+        hp.addEventListener('change',()=>{const n=Number(hp.value);if(Number.isInteger(n)&&n>=0&&n<=r.mon.maxHp){reserveEdits.set(r.mon.id,{...(reserveEdits.get(r.mon.id)||{}),hp:n});refreshView();}});line.append(hp,create('span','/ '+r.mon.maxHp));details.appendChild(line);
+      }
+      const known=create('input');known.type='checkbox';known.checked=roster.known;known.setAttribute('aria-label',actorLabel(role)+' party is complete');known.addEventListener('change',()=>{prefs.partyConfirmed=known.checked;refreshView();});const confirm=create('label',null,'pkai-line');confirm.append(known,create('span','Party list is complete; unlisted slots are unavailable'));details.appendChild(confirm);
+      renderPresetPicker(details,'reserve-'+role,id=>{prefs.manualParty=[...new Set([...(prefs.manualParty||roster.party.map(r=>r.mon.id)),id])];prefs.partyConfirmed=true;refreshView();},actorLabel(role)+' reserve');
+      const empty=create('button','No living reserves');empty.type='button';empty.addEventListener('click',()=>{prefs.manualParty=[];prefs.partyConfirmed=true;refreshView();});details.appendChild(empty);
+      const reset=create('button','Reload trainer party');reset.type='button';reset.addEventListener('click',()=>{prefs.manualParty=null;prefs.partyConfirmed=null;partyCache.clear();refreshView();});details.appendChild(reset);
+    }
+    if(p.controls?.length){const extra=create('details');extra.appendChild(create('summary','Move-scoring history and conditions'));
+      for(const spec of p.controls){const named={...spec,id:spec.id,label:spec.field==='abilityKnown'?'Has '+shortName(p.state.targets[spec.targetIndex]?.name)+'’s ability been revealed to this AI?':spec.label};
+        const control=renderControl(named,prefs.context);for(const el of control.querySelectorAll('[id]')){const old=el.id;el.id='pkai-'+role+'-'+old;const lab=control.querySelector('label[for="'+old+'"]');if(lab)lab.htmlFor=el.id;}extra.appendChild(control);
+      }details.appendChild(extra);
+    }
+    if(p.state)for(let i=0;i<p.state.moves.length;i++){const m=p.state.moves[i];if(!m.name||key(m.name)==='nomove')continue;
+      const check=create('input');check.type='checkbox';check.checked=!prefs.disabled.has(i)&&m.currentPP!==0;check.disabled=m.currentPP===0;check.setAttribute('aria-label',actorLabel(role)+' can select '+m.name);check.addEventListener('change',()=>{if(check.checked)prefs.disabled.delete(i);else prefs.disabled.add(i);refreshView();});const line=create('label',null,'pkai-line');line.append(check,create('span',m.name+' can be selected'));details.appendChild(line);
+    }
+    host.appendChild(details);
+  }
+  function renderAllPredictions(predictions){
+    const wrap=create('section');wrap.id='pkai-all-predictions';wrap.setAttribute('aria-label','All three AI choices');
+    wrap.appendChild(create('h3','All three AI choices'));
+    for(const p of predictions||[]){
+      const card=create('fieldset');card.dataset.prediction=p.role;
+      card.appendChild(create('legend',actorLabel(p.role)+' · '+shortName(p.record?.mon.name||'Not selected')));
+      card.appendChild(create('div',p.flagsSource||'Choose a Pokémon to load its trainer AI.','pkai-help'));
+      if(p.switching){const s=p.switching;
+        card.appendChild(create('strong',s.known?'Switch command: ~'+(s.switchProbability*100).toFixed(1)+'% · Stay in: ~'+(s.stayProbability*100).toFixed(1)+'%':'Switch command: unknown'));
+        card.appendChild(create('div',s.reason||'Switching input required','pkai-help'));
+        for(const x of s.choices)card.appendChild(create('div','Switch → '+shortName(x.name)+': ~'+(x.probability*100).toFixed(1)+'%','pkai-line'));
+        for(const x of s.missing||[])card.appendChild(create('div',x,'pkai-warning'));
+        if(p.notes?.some(n=>n.includes('assumes no previous hit')))card.appendChild(create('div','Switch estimate assumes no previous hit. Enter the last-hit move and attacker below for later turns.','pkai-warning'));
+      }
+      if(p.record?.mon.hp===0)card.appendChild(create('p','Fainted: move selection is not available.'));
+      if(p.result){
+        const scale=p.switching?.known?p.switching.stayProbability:1;
+        card.appendChild(create('div',p.switching?.known?'Move percentages below include the chance of staying in.':'Move percentages below are conditional on staying in; switching has not been resolved.','pkai-help'));
+        const table=create('table');table.className='pkai-target-table';table.style.cssText='width:100%;text-align:right;border-collapse:collapse';table.setAttribute('aria-label',actorLabel(p.role)+' move and target odds');
+        const head=create('tr');head.appendChild(create('th','Move'));
+        for(let t=0;t<p.result.targetNames.length;t++)head.appendChild(create('th',shortName(p.result.targetNames[t])+(p.result.targetIsAlly[t]?' · teammate':'')));
+        head.appendChild(create('th','Move total'));table.appendChild(head);
+        for(let i=0;i<p.result.choice.length;i++){const row=create('tr');row.appendChild(create('td',p.state.moves[i].name));for(const v of [...p.result.choice[i].targets,p.result.choice[i].total])row.appendChild(create('td','~'+(v*scale*100).toFixed(1)+'%'));table.appendChild(row);}
+        const scroll=create('div');scroll.style.overflowX='auto';scroll.appendChild(table);card.appendChild(scroll);
+        const pivot=p.result.choice.reduce((n,x,i)=>n+(key(p.state.moves[i].name)==='uturn'?x.total*scale:0),0);
+        if(pivot>0)card.appendChild(create('div','U-turn chosen: ~'+(pivot*100).toFixed(1)+'%. '+(p.roster?.known&&!p.roster.party.some(r=>r.mon.hp>0)?'No eligible reserve: it cannot pivot out.':'If the move executes successfully, its replacement is selected afterward; this is separate from a switch command.'),'pkai-help'));
+      }
+      for(const error of p.errors||[])card.appendChild(create('div',error,'pkai-warning'));
+      renderActorInputs(card,p);
+      const info=create('details');info.appendChild(create('summary','Prediction assumptions and switch reasons'));
+      for(const note of [...(p.notes||[]),...(p.switching?.notes||[]),...(p.assumptions||[])])info.appendChild(create('div',note,'pkai-help'));
+      for(const x of p.switching?.choices||[])for(const reason of x.reasons||[])info.appendChild(create('div',shortName(x.name)+': '+reason,'pkai-help'));
+      card.appendChild(info);wrap.appendChild(card);
+    }
+    wrap.appendChild(create('p','Each card predicts its own decision on the current board. It does not multiply independent percentages into a guaranteed turn outcome or apply damage, misses, flinches, or KOs.','pkai-help'));
+    wrap.appendChild(create('p','Target columns are AI scoring targets. Self moves such as Soft-Boiled act on their user; spread moves can hit both opposing Pokémon. The teammate column refers to that actor’s own partner.','pkai-help'));
+    panel.appendChild(wrap);
+  }
+
   function renderMoveAvailability(state){
     const details=create('details');details.appendChild(create('summary','Move availability (PP, Taunt, Encore, Choice lock)'));
     const disabled=unavailableMoves.get(selectedKey)||new Set();
@@ -3115,14 +3813,15 @@
   }
   function renderTargetOdds(result,state){
     if(!result||result.mode!=='Doubles')return;
-    const table=create('table');table.style.cssText='width:100%;border-collapse:collapse;margin-top:8px;text-align:right';
+    panel.appendChild(create('strong','Predicted choices: '+shortName(state.name||selectedSet('#p2'))));
+    const table=create('table');table.className='pkai-target-table';table.style.cssText='width:100%;border-collapse:collapse;margin-top:8px;text-align:right';table.setAttribute('aria-label','Move and target selection probabilities');
     const head=create('tr');head.appendChild(create('th','Move'));
-    for(let i=0;i<result.targetNames.length;i++){const th=create('th',result.targetIsAlly[i]?'AI partner':'Opponent '+(i?'B':'A'));th.title=result.targetNames[i];head.appendChild(th);}head.appendChild(create('th','Total'));table.appendChild(head);
+    for(let i=0;i<result.targetNames.length;i++){const role=result.targetIsAlly[i]?'Other enemy':slotLabel(i?'b':'a');const th=create('th',shortName(result.targetNames[i])+' · '+role);th.scope='col';th.title=result.targetNames[i];head.appendChild(th);}head.appendChild(create('th','Move total'));table.appendChild(head);
     for(let i=0;i<result.choice.length;i++){
       const row=create('tr');row.appendChild(create('td',state.moves[i].name));
       for(const p of [...result.choice[i].targets,result.choice[i].total]){const cell=create('td',(p*100).toFixed(1)+'%');cell.style.padding='4px';row.appendChild(cell);}table.appendChild(row);
     }
-    const wrapper=create('div');wrapper.style.overflowX='auto';wrapper.appendChild(table);panel.appendChild(wrapper);panel.appendChild(create('div','Columns show the AI’s scoring target. Self moves act on the user; spread moves hit every eligible battler. The AI first breaks move ties within each target, then target ties.','pkai-help'));
+    const wrapper=create('div');wrapper.style.overflowX='auto';wrapper.appendChild(table);panel.appendChild(wrapper);panel.appendChild(create('div','Each cell is the chance of choosing that move AND that scoring target. Move total adds the target columns. The other-enemy column covers moves aimed at the AI’s teammate. Self moves act on the user; spread moves can hit both of your side’s Pokémon regardless of the scoring target. These are one enemy’s choices, not combined turn outcomes.','pkai-help'));
   }
 
   function inputValue(overrides,id){return Object.prototype.hasOwnProperty.call(overrides,id)?overrides[id]:null;}
@@ -3130,7 +3829,13 @@
     const row=create('div',null,'pkai-line');row.title=spec.detail||'';
     const id='pkai-field-'+spec.id.replace(/[^a-z0-9]+/gi,'-');
     const value=inputValue(store,spec.id);
-    if(spec.options){
+    if(spec.field==='abilityKnown'){
+      const label=create('label',spec.label);label.htmlFor=id;row.appendChild(label);
+      const select=create('select');select.id=id;select.setAttribute('aria-label',spec.label);
+      for(const [v,text]of [['','Unknown — use approximation'],['false','No — not revealed'],['true','Yes — revealed']]){const o=create('option',text);o.value=v;select.appendChild(o);}
+      select.value=value==null?'':String(value);
+      select.addEventListener('change',()=>{if(select.value==='')delete store[spec.id];else store[spec.id]=select.value==='true';refreshView();});row.appendChild(select);
+    }else if(spec.options){
       const label=create('label',spec.label);label.htmlFor=id;row.appendChild(label);
       const select=create('select');select.id=id;select.setAttribute('aria-label',spec.label);
       const none=create('option','Choose…');none.value='';select.appendChild(none);
@@ -3202,23 +3907,23 @@
   }
   function renderPanel(snapshot,applicable,missing,blockers,result,notes){
     panel.replaceChildren();
-    const header=create('div',null,'pkai-header');header.appendChild(create('span','AI context'));
+    const header=create('div',null,'pkai-header');header.appendChild(create('span','AI prediction v1.19 · '+shortName(snapshot.state.name||selectedSet('#p2'))));
     if(snapshot.flagsSource!=='native')header.appendChild(create('span','Assumed flags'));
     panel.appendChild(header);
 
-    const speed=adapter.readAttackOrder(doc,'R','L');
-    if(Number.isFinite(speed.aiSpeed)&&Number.isFinite(speed.foeSpeed)){
-      panel.appendChild(create('div',
-        `Speed: AI ${speed.aiSpeed} / yours ${speed.foeSpeed} — `+
-        (speed.aiSpeed<speed.foeSpeed?'AI slower':speed.aiSpeed>speed.foeSpeed?'AI faster':'Speed tie')+
-        '','pkai-help'));
-    }
-    renderBoard(snapshot.state);renderMoveAvailability(latest?.scoringState||snapshot.state);renderApproximation(latest?.scoringState||snapshot.state);renderTargetOdds(result,latest?.scoringState||snapshot.state);
+    const scored=latest?.scoringState||snapshot.state;
+    if(Number.isFinite(scored.speed))panel.appendChild(create('div','Speed: '+shortName(scored.name||selectedSet('#p2'))+' '+scored.speed+
+      scored.targets.map(t=>' · '+shortName(t.name)+' '+(Number.isFinite(t.speed)?t.speed:'?')).join('')+' (move priority is separate)','pkai-help'));
+    renderBoard(snapshot.state);if(snapshot.state.format!=='Doubles')renderMoveAvailability(latest?.scoringState||snapshot.state);renderApproximation(latest?.scoringState||snapshot.state);
+    if(snapshot.state.format==='Doubles')renderAllPredictions(latest?.predictions);else renderTargetOdds(result,latest?.scoringState||snapshot.state);
     const flags=renderFlags(snapshot.flagsSource==='native'?snapshot.state.flags:null,snapshot.state.format);if(flags)panel.appendChild(flags);
     if(applicable.length){
       const groups=new Map();for(const spec of applicable){
-        if(!groups.has(spec.group))groups.set(spec.group,[]);
-        groups.get(spec.group).push(spec);
+        const target=Number.isInteger(spec.targetIndex)?scored.targets[spec.targetIndex]:null;
+        const group=target?shortName(target.name)+' · '+(scored.format==='Doubles'?slotLabel(spec.targetIndex?'b':'a'):'Your Pokémon'):spec.group;
+        const named=spec.field==='abilityKnown'&&target?{...spec,label:'Has '+shortName(target.name)+'’s ability been revealed to the enemy AI?'}:spec;
+        if(!groups.has(group))groups.set(group,[]);
+        groups.get(group).push(named);
       }
       let store=overridesBySelection.get(selectedKey);
       if(!store){store={};overridesBySelection.set(selectedKey,store);}
@@ -3251,11 +3956,14 @@
       if(!span){span=create('span','','pkai-inline-odds');span.id='pkai-odds-R'+(i+1);}
       if(anchor.nextElementSibling!==span)anchor.insertAdjacentElement('afterend',span);
       span.dataset.pkaiPlacement=mode==='damage'?'damage':'fallback';
-      const move=snapshot?.state?.moves?.[i];
+      const forecast=latest?.predictions?.find(p=>automatic()?p.record?.setId===selectedSet('#p2'):p.role==='enemyLeft');
+      if(automatic()&&snapshot?.state?.format==='Doubles'&&!forecast){span.textContent='';continue;}
+      const move=forecast?.state?.moves?.[i]||snapshot?.state?.moves?.[i];
       if(!move || ['nomove','loading'].includes(key(move.name))){span.textContent='';continue;}
-      const score=result?.choice?.[i]?.total;
+      const base=forecast?forecast.result?.choice?.[i]?.total:result?.choice?.[i]?.total;
+      const score=Number.isFinite(base)?base*(forecast?.switching?.known?forecast.switching.stayProbability:1):base;
       span.textContent=Number.isFinite(score)?` (AI est: ~${(score*100).toFixed(1)}%)`:' (AI: —)';
-      span.title=Number.isFinite(score)?'Conditional estimated move-selection chance. '+notes.join(' '):
+      span.title=Number.isFinite(score)?(forecast?.switching?.known?(forecast?actorLabel(forecast.role):'AI')+': includes the chance of staying in. ':(forecast?actorLabel(forecast.role):'AI')+': conditional on staying in; switching not resolved. ')+notes.join(' '):
         'Cannot calculate: '+(blockers[0]||'missing battle data')+'. See AI scoring context below the moves.';
     }
   }
@@ -3306,10 +4014,11 @@
     if(refreshing)return;refreshing=true;
     try{
       removeLegacyControls();attachPanel();
-      selectedKey=selectionKey();
       const snapshot=adapter.readBattle(doc,globalThis);
+      syncAutomaticBoard(snapshot.state);
+      const boarded=applyBoardAndDamage(primaryBoardState(snapshot.state));
+      selectedKey=selectionKey();
       const store=overridesBySelection.get(selectedKey)||{};
-      const boarded=applyBoardAndDamage(snapshot.state);
       const original=boarded.state;
       snapshot.state=original;
       snapshot.issues=snapshot.issues.filter(x=>!['Doubles board'].includes(x.field)&&!x.detail.includes('No separate calculator result')); 
@@ -3341,6 +4050,7 @@
       const missing=unresolved.map(x=>x.label+' (not provided by calculator)');
       latest={snapshot:{...snapshot,state,flagsSource},missing,blockers,result,notes,controls:applicable,
         scoringState:prepared.state,readingWarnings:prepared.warnings,assumptions:approximation.assumptions};
+      latest.predictions=state.format==='Doubles'?allActorPredictions(prepared.state):[];
       paintInline(latest.snapshot,result,blockers,notes);
       renderPanel({...snapshot,state:original,flagsSource},applicable,missing,blockers,result,notes);
     }catch(e){
@@ -3350,7 +4060,7 @@
       panel.replaceChildren(create('strong',error,'pkai-warning'));
     }finally{refreshing=false;}
   }
-  const isOwn=node=>node?.closest?.('#pkai-context,.pkai-inline-odds');
+  const isOwn=node=>node?.closest?.('#pkai-context,#pkai-battlefield-dock,.pkai-selection-strip,.pkai-inline-odds');
   function queue(){if(scheduleTimer!==null)return;scheduleTimer=setTimeout(()=>{scheduleTimer=null;refreshView();},140);}
   const observer=new MutationObserver(changes=>{
     for(const m of changes){
@@ -3363,17 +4073,39 @@
       }
       const changed=[...m.addedNodes,...m.removedNodes];
       if(changed.length&&changed.every(n=>n.nodeType===1 &&
-        (n.matches?.('.pkai-inline-odds,#pkai-context')||n.closest?.('#pkai-context'))))continue;
+        (n.matches?.('.pkai-inline-odds,#pkai-context,#pkai-battlefield-dock,.pkai-selection-strip')||isOwn(n))))continue;
       const changedResult=changed.some(n=>n.nodeType===1&&
         (n.matches?.('[id^="resultDamageR"],.results-right,.move-result-group')||n.querySelector?.('[id^="resultDamageR"]')));
       if(changedResult||node?.closest?.('#p1,#p2,#p1-2,#p2-2,.move-result-group,.field-info,#field,#ai-container')){queue();break;}
     }
   });
   observer.observe(doc.body,{subtree:true,childList:true,characterData:true});
-  doc.addEventListener('input',e=>{if(!isOwn(e.target))queue();},true);
-  doc.addEventListener('change',e=>{if(!isOwn(e.target))queue();},true);
-  globalThis.PKAIInline={version:'1.13.0',refresh:refreshView,snapshot:()=>latest?.snapshot?.state,
+  const onEditorEvent=e=>{if(!isOwn(e.target))queue();};
+  const onPokemonClick=e=>{
+    if(isOwn(e.target))return;
+    const item=e.target.closest?.('.trainer-pok[data-id],.tag-partner-pok[data-id]')||e.target.closest?.('.trainer-pok-container')?.querySelector('[data-id]');
+    if(item?.dataset.id){
+      const meta=setMetadata(item.dataset.id),right=setMetadata(selectedSet('#p2'));
+      if(!modeChosen&&((meta?.partner&&meta?.tagPartner)||(right?.partner&&right?.tagPartner)))tagBattle=true;
+      if(automatic())pendingSelections.push(item.dataset.id);
+      // Render after native click handlers finish updating their editor. This
+      // also handles clicking an image that emits only jQuery change events.
+      queueMicrotask(refreshView);queue();
+    }
+  };
+  doc.addEventListener('input',onEditorEvent,true);
+  doc.addEventListener('change',onEditorEvent,true);
+  doc.addEventListener('click',onPokemonClick,true);
+  // Select2 uses jQuery events; these do not always emit native DOM change events.
+  let jqDocument=null;
+  try{jqDocument=globalThis.jQuery?.(doc);jqDocument?.on('change.pkaiAutoSlots select2-selected.pkaiAutoSlots','.set-selector',onEditorEvent);}catch{}
+
+  globalThis.PKAIInline={version:'1.19.0',
+    dispose:()=>{observer.disconnect();if(scheduleTimer!==null)clearTimeout(scheduleTimer);doc.removeEventListener('input',onEditorEvent,true);doc.removeEventListener('change',onEditorEvent,true);doc.removeEventListener('click',onPokemonClick,true);jqDocument?.off('.pkaiAutoSlots');clearSpriteFeedback();boardDock.remove();panel.remove();css.remove();},
+    battlefield:()=>Object.fromEntries(Object.entries(board()).map(([k,r])=>[k,r?{setId:r.setId,trainerId:r.meta?.tr_id,hp:r.mon.hp}:null])),
+    refresh:refreshView,snapshot:()=>latest?.snapshot?.state,
     result:()=>latest?.result,scoringState:()=>latest?.scoringState,assumptions:()=>latest?.assumptions||[],
+    predictions:()=>latest?.predictions||[],
     locations:locateInline,diagnostics:()=>latest?.error?[latest.error]:[...(latest?.blockers||[]),...(latest?.missing||[]),...(latest?.notes||[])],
     controls:()=>latest?.controls||[],
     flagSource:()=>latest?.snapshot?.flagsSource,
@@ -3383,3 +4115,163 @@
   refreshView();
 })();
 
+
+/* Box matchup color coding. This uses battle damage ranges, independently of AI move scores. */
+(function(root){
+  'use strict';
+  const COLORS={hardCounter:'#559dcc',wall:'#3737e2',always:'#6cce41',might:'#e0fb55',mightTaken:'#e88638',alwaysTaken:'#c43020',fast:'#98def2',tie:'#80478f',slow:'#171313'};
+  const LABELS={hardCounter:'Hard Counter',wall:'Walls',always:'Always OHKOs',might:'Might OHKO',mightTaken:"Might get OHKO’d",alwaysTaken:"Always gets OHKO’d",bothAlways:'Both sides OHKO each other',bothMight:'Both sides might OHKO each other',alwaysMightTaken:'Always OHKOs but may get OHKO’d',mightAlwaysTaken:'Might OHKO but always gets OHKO’d'};
+  function classify(metrics){
+    if(!metrics||!Number.isFinite(metrics.bestMinDealtPercent)||!Number.isFinite(metrics.worstMaxTakenPercent))return null;
+    const out=metrics.ohko?2:metrics.mbOhko?1:0,inc=metrics.ohkod?2:metrics.mbOhkod?1:0;
+    // At least four hits are needed even at the opposing move's maximum roll.
+    const walls=metrics.worstMaxTakenPercent*3<100;
+    if(walls&&out)return 'hardCounter';
+    if(walls&&metrics.bestMinDealtPercent>metrics.worstMaxTakenPercent)return 'wall';
+    if(out===2&&inc===2)return 'bothAlways';
+    if(out===1&&inc===1)return 'bothMight';
+    if(out===2&&inc===1)return 'alwaysMightTaken';
+    if(out===1&&inc===2)return 'mightAlwaysTaken';
+    if(out===2)return 'always';if(out===1)return 'might';if(inc===2)return 'alwaysTaken';if(inc===1)return 'mightTaken';return null;
+  }
+  function speedKind(speed,opponentSpeed){
+    if(!Number.isFinite(speed)||!Number.isFinite(opponentSpeed))return null;
+    return speed>opponentSpeed?'fast':speed===opponentSpeed?'tie':'slow';
+  }
+  function background(category){
+    const pairs={bothAlways:['always','alwaysTaken'],bothMight:['might','mightTaken'],alwaysMightTaken:['always','mightTaken'],mightAlwaysTaken:['might','alwaysTaken']};
+    if(pairs[category])return 'linear-gradient(90deg, '+COLORS[pairs[category][0]]+' 0%, '+COLORS[pairs[category][0]]+' 50%, '+COLORS[pairs[category][1]]+' 50%, '+COLORS[pairs[category][1]]+' 100%)';
+    return COLORS[category]||'';
+  }
+  const api={classify,speedKind,background,colors:COLORS,labels:LABELS};root.PKAIBoxColors=api;
+  if(typeof document==='undefined')return;
+  const doc=document,STORAGE_KEY='pkai.boxColors.v1';
+  if(doc.getElementById('pkai-box-color-style'))return;
+  let prefs={enabled:false,speed:true,ohko:true,auto:true};
+  try{const saved=JSON.parse(root.localStorage.getItem(STORAGE_KEY)||'null');if(saved)for(const k of Object.keys(prefs))if(typeof saved[k]==='boolean')prefs[k]=saved[k];}catch{}
+  const controls=new Set(),cardSelector='.player-poks .trainer-pok[data-id], .player-party .trainer-pok[data-id], .player-megas .trainer-pok[data-id], .mobile-box-shortcut-poks .trainer-pok[data-id], .mobile-box-shortcut-party .trainer-pok[data-id], .mobile-box-shortcut-megas .trainer-pok[data-id], #box-card-grid .box-card[data-species]';
+  let timer=null,generation=0,lastStatus='',busy=false;
+  const create=(tag,text)=>{const n=doc.createElement(tag);if(text!=null)n.textContent=text;return n;};
+  const style=create('style');style.id='pkai-box-color-style';
+  style.textContent=`
+    .pkai-box-color-controls{clear:both;box-sizing:border-box;margin-top:12px;padding-top:10px;border-top:1px solid #777;font:12px/1.4 system-ui,Arial,sans-serif;color:inherit}
+    .pkai-box-color-controls>button{display:block;width:100%;box-sizing:border-box;padding:7px 10px;border:1px solid #98def2;border-radius:5px;background:transparent;color:inherit;font:inherit;cursor:pointer}
+    .pkai-box-color-controls>button[aria-pressed="true"]{background:#244858;color:#fff}
+    .pkai-box-color-controls .pkai-box-color-legend{margin-top:9px}
+    .pkai-box-color-controls h4{margin:7px 0 4px;font:600 13px/1.4 system-ui,Arial,sans-serif;color:inherit}
+    .pkai-box-color-controls .pkai-color-sample{display:inline-block;padding:0 2px;color:#101010;font-weight:750}
+    .pkai-box-color-controls .pkai-speed-sample{display:inline-block;border:3px solid;border-radius:7px;padding:0 2px;color:#e4e4e4;font-weight:650}
+    .pkai-box-color-controls .pkai-speed-key{display:flex;gap:7px;align-items:center;flex-wrap:wrap}
+    .pkai-box-color-controls .pkai-box-color-options{display:flex;gap:7px 10px;flex-wrap:wrap;margin-top:7px;align-items:center}
+    .pkai-box-color-controls label{display:inline-flex;align-items:center;gap:4px;cursor:pointer}
+    .pkai-box-color-controls input[type="checkbox"]{appearance:auto!important;display:inline-block!important;position:static!important;visibility:visible!important;opacity:1!important;width:14px!important;height:14px!important;margin:0!important}
+    .pkai-box-color-controls small{display:block;font-size:11px;margin-top:5px;opacity:.85}
+    .pkai-box-color-controls .pkai-color-refresh{font:inherit;padding:2px 6px;cursor:pointer}
+    [data-pkai-box-overlay]{background:var(--pkai-box-background,transparent)!important;background-image:var(--pkai-box-background-image,none)!important;border-color:transparent!important;box-shadow:none!important}
+    [data-pkai-box-speed]{outline:3px solid var(--pkai-box-speed)!important;outline-offset:-1px;border-radius:7px!important}
+    [data-pkai-box-category]{background:var(--pkai-box-background)!important;background-image:var(--pkai-box-background-image,none)!important}
+    .box-sort-card:has(> [data-pkai-box-overlay]){background:transparent!important;box-shadow:none!important}
+    #box-card-grid .box-card[data-pkai-box-category] .box-card-name{background:rgba(20,20,20,.82);color:#fff;padding:1px 4px;border-radius:3px}
+  `;doc.head.appendChild(style);
+  function save(){try{root.localStorage.setItem(STORAGE_KEY,JSON.stringify(prefs));}catch{}}
+  function clearCard(el){
+    if(el.hasAttribute('data-pkai-box-category')){el.removeAttribute('data-pkai-box-category');el.style.removeProperty('--pkai-box-background');el.style.removeProperty('--pkai-box-background-image');}
+    if(el.hasAttribute('data-pkai-box-speed')){el.removeAttribute('data-pkai-box-speed');el.style.removeProperty('--pkai-box-speed');}
+    el.removeAttribute('data-pkai-box-overlay');el.removeAttribute('data-pkai-box-matchup');
+  }
+  function clearAll(){doc.querySelectorAll('[data-pkai-box-overlay],[data-pkai-box-category],[data-pkai-box-speed],[data-pkai-box-matchup]').forEach(clearCard);}
+  function setStatus(text){lastStatus=text;for(const c of controls)if(c.isConnected)c.querySelector('[data-pkai-color-status]').textContent=text;}
+  function syncControls(){
+    for(const c of controls){if(!c.isConnected){controls.delete(c);continue;}
+      const toggle=c.querySelector('[data-pkai-color-toggle]');toggle.textContent='Color Coding: '+(prefs.enabled?'On':'Off');toggle.setAttribute('aria-pressed',String(prefs.enabled));
+      c.querySelector('.pkai-box-color-legend').hidden=!prefs.enabled;
+      for(const key of ['speed','ohko','auto'])c.querySelector('[data-pkai-color-option="'+key+'"]').checked=prefs[key];
+      c.querySelector('[data-pkai-color-status]').textContent=lastStatus;
+    }
+  }
+  function buildControls(host,suffix){
+    if(!host||host.querySelector(':scope > .pkai-box-color-controls'))return;
+    const c=create('section');c.className='pkai-box-color-controls';c.setAttribute('aria-label','Box matchup color coding');
+    const toggle=create('button');toggle.type='button';toggle.id='pkai-box-colors-toggle-'+suffix;toggle.dataset.pkaiColorToggle='';
+    toggle.addEventListener('click',()=>setEnabled(!prefs.enabled));c.appendChild(toggle);
+    const legend=create('div');legend.className='pkai-box-color-legend';
+    legend.appendChild(create('h4','Speed Borders'));const speeds=create('div');speeds.className='pkai-speed-key';
+    for(const [key,color,label]of [['fast','Blue','Outspeeds'],['tie','Purple','Speed Tie'],['slow','Black','Slower']]){
+      const item=create('span'),sample=create('span',color);sample.className='pkai-speed-sample';sample.style.borderColor=COLORS[key];item.append(sample,doc.createTextNode(' '+label));speeds.appendChild(item);
+    }legend.appendChild(speeds);legend.appendChild(create('h4','OHKO Colors'));
+    for(const key of Object.keys(LABELS)){
+      const row=create('div'),sample=create('span',LABELS[key]);sample.className='pkai-color-sample';sample.style.background=background(key);row.appendChild(sample);
+      if(key==='hardCounter')row.appendChild(doc.createTextNode(' (takes ≥4 hits at worst and may OHKO)'));
+      if(key==='wall')row.appendChild(doc.createTextNode(' (takes ≥4 hits at worst and deals more damage)'));
+      legend.appendChild(row);
+    }
+    legend.appendChild(create('small','Against the selected enemy, using current battle settings and damage ranges. Walls compare your minimum damage with the enemy’s maximum, as percentages of current HP. Healing, residual damage, priority and other battle effects can change the outcome.'));
+    const options=create('div');options.className='pkai-box-color-options';
+    for(const [key,label]of [['speed','Speed Border'],['ohko','OHKO Color'],['auto','Auto-Refresh']]){
+      const l=create('label'),input=create('input');input.type='checkbox';input.dataset.pkaiColorOption=key;
+      input.addEventListener('change',()=>{prefs[key]=input.checked;save();syncControls();if(prefs.enabled)refresh();});l.append(input,doc.createTextNode(label));options.appendChild(l);
+    }
+    const refreshButton=create('button','Refresh');refreshButton.type='button';refreshButton.className='pkai-color-refresh';refreshButton.addEventListener('click',refresh);options.appendChild(refreshButton);legend.appendChild(options);
+    const status=create('small');status.dataset.pkaiColorStatus='';status.setAttribute('role','status');legend.appendChild(status);c.appendChild(legend);host.appendChild(c);controls.add(c);syncControls();
+  }
+  function mount(){buildControls(doc.getElementById('player-poks-filter'),'menu');buildControls(doc.getElementById('box-controls'),'box');}
+  function setEnabled(value){prefs.enabled=!!value;save();generation++;busy=false;if(timer!=null){clearTimeout(timer);timer=null;}if(!prefs.enabled){clearAll();setStatus('');}syncControls();if(prefs.enabled)refresh();}
+  function getContext(){
+    if(typeof root.getBoxMatchupContextOptions!=='function'||typeof root.getSafeBoxMatchupMetrics!=='function')return null;
+    const context=root.getBoxMatchupContextOptions();if(!context)return null;
+    const speed=root.PKAICalcAdapter?.effectiveSpeed(doc,'R')?.value;
+    if(Number.isFinite(speed))context.opponentSpeed=speed;
+    // This overlay always assesses the full movesets, independently of numeric box searches.
+    return {...context,advBoxrollsEnabled:true,dealtMinRoll:'',takenMaxRoll:'',selectedMoveIndex:0,fingerprint:context.fingerprint+'::pkai-matchup-colors-all-moves'};
+  }
+  function refresh(){
+    if(timer!=null){clearTimeout(timer);timer=null;}
+    mount();const run=++generation;if(!prefs.enabled){clearAll();return;}
+    let context;try{context=getContext();}catch{context=null;}
+    if(!context){clearAll();setStatus('Select an enemy and wait for the calculator to load matchup data.');busy=false;return;}
+    const cards=[...doc.querySelectorAll(cardSelector)],groups=new Map();
+    for(const card of cards){const id=card.getAttribute('data-id')||card.getAttribute('data-species')+' (My Box)';if(!groups.has(id))groups.set(id,[]);groups.get(id).push(card);}
+    const entries=[...groups],cache=new Map();let index=0,available=0;busy=true;
+    setStatus(entries.length?'Updating '+entries.length+' matchups…':'Import Pokémon into your box to see matchup colors.');
+    const later=fn=>typeof root.requestAnimationFrame==='function'?root.requestAnimationFrame(fn):setTimeout(fn,0);
+    function batch(){
+      if(run!==generation||!prefs.enabled)return;
+      const end=Math.min(index+10,entries.length);
+      for(;index<end;index++){
+        const [id,nodes]=entries[index];let metrics;
+        try{metrics=root.getSafeBoxMatchupMetrics(id,context);}catch{metrics=null;}
+        const usable=metrics&&Number.isFinite(metrics.bestMinDealtPercent)&&Number.isFinite(metrics.worstMaxTakenPercent);
+        if(usable)available++;
+        const category=prefs.ohko&&usable?classify(metrics):null,speed=prefs.speed&&usable?speedKind(metrics.speed,context.opponentSpeed):null;
+        cache.set(id,{metrics,category,speed});
+        for(const node of nodes){
+          clearCard(node);node.dataset.pkaiBoxOverlay='';
+          if(category){node.dataset.pkaiBoxCategory=category;const bg=background(category);if(bg.startsWith('linear-gradient')){node.style.setProperty('--pkai-box-background','transparent');node.style.setProperty('--pkai-box-background-image',bg);}else{node.style.setProperty('--pkai-box-background',bg);node.style.setProperty('--pkai-box-background-image','none');}}
+          if(speed){node.dataset.pkaiBoxSpeed=speed;node.style.setProperty('--pkai-box-speed',COLORS[speed]);}
+          if(usable)node.dataset.pkaiBoxMatchup=[LABELS[category]||'No OHKO color',speed==='fast'?'Outspeeds':speed==='tie'?'Speed tie':speed==='slow'?'Slower':'Speed border off'].join('; ');
+        }
+      }
+      if(index<entries.length)later(batch);else{busy=false;api.lastMatchups=cache;setStatus(available?available+' matchup'+(available===1?'':'s')+' updated.':entries.length?'Damage data unavailable; no matchup colors applied.':'Import Pokémon into your box to see matchup colors.');}
+    }batch();
+  }
+  function queue(force){
+    if(!prefs.enabled||!prefs.auto&&!force)return;
+    if(timer!=null)clearTimeout(timer);timer=setTimeout(()=>{timer=null;refresh();},180);
+  }
+  function onBattleChange(event){if(event.target?.closest?.('.pkai-box-color-controls'))return;if(event.target?.closest?.('#p1,#p2,.field-info,#field,#filter-move'))queue(false);}
+  doc.addEventListener('input',onBattleChange,true);doc.addEventListener('change',onBattleChange,true);
+  if(typeof root.$==='function')try{root.$(doc).on('change.pkaiBoxColors','#p1 input,#p1 select,#p2 input,#p2 select,.field-info input,.field-info select',onBattleChange);}catch{}
+  const observer=new MutationObserver(changes=>{
+    let cardsChanged=false,needsMount=false;
+    for(const change of changes){
+      if(change.target?.closest?.('.pkai-box-color-controls,#pkai-context'))continue;
+      for(const node of change.addedNodes){if(node.nodeType!==1)continue;
+        if(node.matches?.('#player-poks-filter,#box-controls')||node.querySelector?.('#player-poks-filter,#box-controls'))needsMount=true;
+        if(node.matches?.('.trainer-pok,.box-card,.box-sort-card')||node.querySelector?.('.trainer-pok,.box-card,.box-sort-card'))cardsChanged=true;
+      }
+    }
+    if(needsMount)mount();if(cardsChanged)queue(false);
+  });observer.observe(doc.body,{subtree:true,childList:true});
+  Object.assign(api,{refresh,setEnabled,getPreferences:()=>({...prefs}),isBusy:()=>busy,disconnect:()=>{observer.disconnect();generation++;if(timer!=null)clearTimeout(timer);}});
+  mount();if(prefs.enabled)queue(true);
+})(typeof globalThis!=='undefined'?globalThis:this);
